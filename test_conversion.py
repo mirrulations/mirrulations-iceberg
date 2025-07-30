@@ -23,8 +23,8 @@ def test_conversion():
     
     # Create converter for testing
     converter = IcebergConverter(
-        data_path=data_path,
-        output_path="test-derived-data"
+        data_path=data_path
+        # No output_path specified - will use derived-data in same directory as data_path
     )
     
     # Get docket directories
@@ -65,7 +65,7 @@ def test_conversion():
         except Exception as e:
             print(f"  ✗ Error: {e}")
     
-    print(f"\nTest complete! Check 'test-derived-data' directory for results.")
+    print(f"\nTest complete! Check 'derived-data' directory for results.")
     return True
 
 

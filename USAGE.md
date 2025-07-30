@@ -40,7 +40,7 @@ The script converts each docket into its own Iceberg dataset with three tables:
 ### Local Conversion
 
 ```bash
-# Convert all dockets to local directory
+# Convert all dockets to local directory (creates derived-data inside data directory)
 python convert_to_iceberg.py /path/to/mirrulations/data
 
 # Specify custom output directory
@@ -67,7 +67,7 @@ python convert_to_iceberg.py /path/to/mirrulations/data \
 | Option | Description | Default |
 |--------|-------------|---------|
 | `data_path` | Path to Mirrulations data directory | Required |
-| `--output-path` | Output directory for Iceberg data | `derived-data` |
+| `--output-path` | Output directory for Iceberg data | `derived-data` inside data_path directory |
 | `--s3-bucket` | S3 bucket name for uploading results | None |
 | `--compression` | Compression algorithm | `snappy` |
 
@@ -83,20 +83,23 @@ python convert_to_iceberg.py /path/to/mirrulations/data \
 The script creates the following structure:
 
 ```
-output_path/
-├── agency1/
-│   ├── docket1/
-│   │   └── iceberg/
-│   │       ├── docket_info.parquet
-│   │       ├── documents.parquet
-│   │       └── comments.parquet
-│   └── docket2/
-│       └── iceberg/
-│           ├── docket_info.parquet
-│           ├── documents.parquet
-│           └── comments.parquet
-└── agency2/
-    └── ...
+data_path/
+├── derived-data/
+│   ├── agency1/
+│   │   ├── docket1/
+│   │   │   └── iceberg/
+│   │   │       ├── docket_info.parquet
+│   │   │       ├── documents.parquet
+│   │   │       └── comments.parquet
+│   │   └── docket2/
+│   │       └── iceberg/
+│   │           ├── docket_info.parquet
+│   │           ├── documents.parquet
+│   │           └── comments.parquet
+│   └── agency2/
+│       └── ...
+├── raw-data/
+└── ...
 ```
 
 ## Performance Considerations

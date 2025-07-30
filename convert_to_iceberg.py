@@ -36,7 +36,11 @@ class IcebergConverter:
     
     def __init__(self, data_path: str, output_path: str = None, s3_bucket: str = None):
         self.data_path = Path(data_path)
-        self.output_path = Path(output_path) if output_path else Path("derived-data")
+        # If no output path specified, create derived-data inside the data_path directory
+        if output_path:
+            self.output_path = Path(output_path)
+        else:
+            self.output_path = self.data_path / "derived-data"
         self.s3_bucket = s3_bucket
         self.s3_client = None
         self.s3_fs = None

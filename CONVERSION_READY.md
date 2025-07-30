@@ -57,7 +57,7 @@ All dockets processed successfully with proper data extraction and Parquet conve
 # Test first (recommended)
 python test_conversion.py
 
-# Full conversion to local storage
+# Full conversion to local storage (creates derived-data in same directory as data)
 python convert_to_iceberg.py /path/to/mirrulations/data
 
 # Full conversion with S3 upload
