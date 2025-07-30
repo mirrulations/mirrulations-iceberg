@@ -43,8 +43,11 @@ The script converts each docket into its own Iceberg dataset with three tables:
 # Convert all dockets to local directory (creates derived-data inside data directory)
 python convert_to_iceberg.py /path/to/mirrulations/data
 
-# Specify custom output directory
+# Specify custom output directory (creates derived-data inside specified directory)
 python convert_to_iceberg.py /path/to/mirrulations/data --output-path /path/to/output
+
+# Write to current directory
+python convert_to_iceberg.py /path/to/mirrulations/data --output-path .
 
 # Use different compression
 python convert_to_iceberg.py /path/to/mirrulations/data --compression brotli
@@ -67,7 +70,7 @@ python convert_to_iceberg.py /path/to/mirrulations/data \
 | Option | Description | Default |
 |--------|-------------|---------|
 | `data_path` | Path to Mirrulations data directory | Required |
-| `--output-path` | Output directory for Iceberg data | `derived-data` inside data_path directory |
+| `--output-path` | Directory where `derived-data` folder will be created | `derived-data` inside data_path directory |
 | `--s3-bucket` | S3 bucket name for uploading results | None |
 | `--compression` | Compression algorithm | `snappy` |
 
@@ -82,6 +85,7 @@ python convert_to_iceberg.py /path/to/mirrulations/data \
 
 The script creates the following structure:
 
+**Default behavior (no --output-path):**
 ```
 data_path/
 ├── derived-data/
@@ -100,6 +104,25 @@ data_path/
 │       └── ...
 ├── raw-data/
 └── ...
+```
+
+**With --output-path specified:**
+```
+output_path/
+├── derived-data/
+│   ├── agency1/
+│   │   ├── docket1/
+│   │   │   └── iceberg/
+│   │   │       ├── docket_info.parquet
+│   │   │       ├── documents.parquet
+│   │   │       └── comments.parquet
+│   │   └── docket2/
+│   │       └── iceberg/
+│   │           ├── docket_info.parquet
+│   │           ├── documents.parquet
+│   │           └── comments.parquet
+│   └── agency2/
+│       └── ...
 ```
 
 ## Performance Considerations

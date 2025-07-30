@@ -38,9 +38,11 @@ class IcebergConverter:
         self.data_path = Path(data_path)
         # If no output path specified, create derived-data inside the data_path directory
         if output_path:
-            self.output_path = Path(output_path)
+            self.output_path = Path(output_path).resolve()
+            self.use_derived_data_subdir = True  # Need to create derived-data/ subdirectory
         else:
             self.output_path = self.data_path / "derived-data"
+            self.use_derived_data_subdir = False  # Already pointing to derived-data directory
         self.s3_bucket = s3_bucket
         self.s3_client = None
         self.s3_fs = None
@@ -299,8 +301,13 @@ class IcebergConverter:
         agency = docket_data['agency']
         docket_id = docket_data['docket_id']
         
-        # Create output directory
-        output_dir = self.output_path / agency / docket_id / "iceberg"
+        # Create output directory - handle both cases
+        if self.use_derived_data_subdir:
+            # When output_path is specified, create derived-data/agency/docket_id/iceberg
+            output_dir = self.output_path / "derived-data" / agency / docket_id / "iceberg"
+        else:
+            # When using default, already pointing to derived-data, so just agency/docket_id/iceberg
+            output_dir = self.output_path / agency / docket_id / "iceberg"
         
         success = True
         
