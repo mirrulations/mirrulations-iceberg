@@ -181,7 +181,13 @@ class IcebergConverter:
         docket_id = docket_path.name
         
         # Determine agency from docket ID (e.g., "DEA-2016-0015" -> "DEA")
-        agency = docket_id.split('-')[0] if '-' in docket_id else "UNKNOWN"
+        # Handle cases like "ACF/ACF-2024-0005" -> "ACF"
+        if '/' in docket_id:
+            agency = docket_id.split('/')[0]
+        elif '-' in docket_id:
+            agency = docket_id.split('-')[0]
+        else:
+            agency = "UNKNOWN"
         
         self.logger.info(f"Processing docket: {agency}/{docket_id}")
         
@@ -192,6 +198,14 @@ class IcebergConverter:
             'agency': agency,
             'docket_id': docket_id
         }
+        
+        # Debug: Check what directories exist
+        self.logger.debug(f"  Docket path: {docket_path}")
+        if docket_path.exists():
+            self.logger.debug(f"  Contents: {[d.name for d in docket_path.iterdir() if d.is_dir()]}")
+        else:
+            self.logger.warning(f"  Docket path does not exist: {docket_path}")
+            return result
         
         # Look for data in raw-data subdirectory
         raw_data_path = docket_path / "raw-data"
@@ -272,6 +286,10 @@ class IcebergConverter:
                         flattened_comment = self.flatten_comment_data(comment_data)
                         result['comments'].append(flattened_comment)
         
+        # Debug: Log what data was found
+        self.logger.debug(f"  Found: docket_info={result['docket_info'] is not None}, "
+                         f"documents={len(result['documents'])}, comments={len(result['comments'])}")
+        
         return result
     
     def save_to_parquet(self, data: List[Dict[str, Any]], table_name: str, 
@@ -337,18 +355,33 @@ class IcebergConverter:
             output_dir = self.output_path / agency / docket_id / "iceberg"
         
         success = True
+        files_created = 0
         
         # Save docket info
         if docket_data['docket_info']:
-            success &= self.save_to_parquet([docket_data['docket_info']], 'docket_info', output_dir)
+            if self.save_to_parquet([docket_data['docket_info']], 'docket_info', output_dir):
+                files_created += 1
+            else:
+                success = False
         
         # Save documents
         if docket_data['documents']:
-            success &= self.save_to_parquet(docket_data['documents'], 'documents', output_dir)
+            if self.save_to_parquet(docket_data['documents'], 'documents', output_dir):
+                files_created += 1
+            else:
+                success = False
         
         # Save comments
         if docket_data['comments']:
-            success &= self.save_to_parquet(docket_data['comments'], 'comments', output_dir)
+            if self.save_to_parquet(docket_data['comments'], 'comments', output_dir):
+                files_created += 1
+            else:
+                success = False
+        
+        # Log if no files were created
+        if files_created == 0:
+            self.logger.warning(f"No data found for docket {docket_id} - no files created")
+            return False
         
         return success
     
@@ -359,19 +392,24 @@ class IcebergConverter:
         # Look for raw-data structure (Mirrulations format)
         raw_data_path = self.data_path / "raw-data"
         if raw_data_path.exists():
+            self.logger.debug(f"Found raw-data structure at {raw_data_path}")
             for agency_dir in raw_data_path.iterdir():
                 if agency_dir.is_dir():
+                    self.logger.debug(f"  Agency: {agency_dir.name}")
                     for docket_dir in agency_dir.iterdir():
                         if docket_dir.is_dir():
                             dockets.append(docket_dir)
+                            self.logger.debug(f"    Docket: {docket_dir.name}")
         
         # Look for direct docket structure (like in results/)
         else:
+            self.logger.debug(f"No raw-data structure, looking for direct docket structure")
             for docket_dir in self.data_path.iterdir():
                 if docket_dir.is_dir() and not docket_dir.name.startswith('.'):
                     # Check if this looks like a docket directory
                     if (docket_dir / "raw-data").exists() or (docket_dir / "docket").exists():
                         dockets.append(docket_dir)
+                        self.logger.debug(f"  Found docket: {docket_dir.name}")
         
         # Filter out non-docket directories and sort
         filtered_dockets = []
@@ -380,6 +418,7 @@ class IcebergConverter:
             if docket.name not in ['derived-data', 'raw-data']:
                 filtered_dockets.append(docket)
         
+        self.logger.info(f"Found {len(filtered_dockets)} docket directories")
         return sorted(filtered_dockets)
     
     def check_permissions(self):
