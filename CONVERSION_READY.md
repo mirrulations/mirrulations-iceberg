@@ -57,7 +57,7 @@ All dockets processed successfully with proper data extraction and Parquet conve
 # Test first (recommended)
 python test_conversion.py
 
-# Full conversion to local storage (creates derived-data in same directory as data)
+# Full conversion to local storage (creates derived-data inside data directory)
 python convert_to_iceberg.py /path/to/mirrulations/data
 
 # Full conversion with S3 upload
@@ -70,29 +70,32 @@ python convert_to_iceberg.py /path/to/mirrulations/data --compression brotli
 ## 📁 Output Structure
 
 ```
-derived-data/
-├── CMS/
-│   ├── CMS-2025-0020/
-│   │   └── iceberg/
-│   │       ├── docket_info.parquet
-│   │       ├── documents.parquet
-│   │       └── comments.parquet
-│   └── CMS-2025-0050/
-│       └── iceberg/
-│           ├── docket_info.parquet
-│           ├── documents.parquet
-│           └── comments.parquet
-├── DEA/
-│   ├── DEA-2016-0015/
-│   │   └── iceberg/
-│   │       ├── docket_info.parquet
-│   │       ├── documents.parquet
-│   │       └── comments.parquet
-│   └── DEA-2024-0059/
-│       └── iceberg/
-│           ├── docket_info.parquet
-│           ├── documents.parquet
-│           └── comments.parquet
+data_path/
+├── derived-data/
+│   ├── CMS/
+│   │   ├── CMS-2025-0020/
+│   │   │   └── iceberg/
+│   │   │       ├── docket_info.parquet
+│   │   │       ├── documents.parquet
+│   │   │       └── comments.parquet
+│   │   └── CMS-2025-0050/
+│   │       └── iceberg/
+│   │           ├── docket_info.parquet
+│   │           ├── documents.parquet
+│   │           └── comments.parquet
+│   ├── DEA/
+│   │   ├── DEA-2016-0015/
+│   │   │   └── iceberg/
+│   │   │       ├── docket_info.parquet
+│   │   │       ├── documents.parquet
+│   │   │       └── comments.parquet
+│   │   └── DEA-2024-0059/
+│   │       └── iceberg/
+│   │           ├── docket_info.parquet
+│   │           ├── documents.parquet
+│   │           └── comments.parquet
+│   └── ...
+├── raw-data/
 └── ...
 ```
 
