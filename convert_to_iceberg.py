@@ -166,6 +166,12 @@ class IcebergConverter:
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 return json.load(f)
+        except PermissionError as e:
+            self.logger.error(f"Permission denied reading {file_path}: {e}")
+            raise
+        except FileNotFoundError as e:
+            self.logger.warning(f"File not found: {file_path}")
+            return None
         except Exception as e:
             self.logger.warning(f"Failed to load {file_path}: {e}")
             return None
@@ -279,19 +285,40 @@ class IcebergConverter:
             parquet_path = output_dir / f"{table_name}.parquet"
             
             # Create output directory
-            output_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                output_dir.mkdir(parents=True, exist_ok=True)
+            except PermissionError as e:
+                self.logger.error(f"Permission denied creating directory {output_dir}: {e}")
+                raise
+            except Exception as e:
+                self.logger.error(f"Failed to create directory {output_dir}: {e}")
+                raise
             
             # Save to Parquet
-            df.to_parquet(parquet_path, index=False, compression=compression)
+            try:
+                df.to_parquet(parquet_path, index=False, compression=compression)
+            except PermissionError as e:
+                self.logger.error(f"Permission denied writing to {parquet_path}: {e}")
+                raise
+            except Exception as e:
+                self.logger.error(f"Failed to save {table_name} to {parquet_path}: {e}")
+                raise
             
             # Upload to S3 if configured
             if self.s3_bucket and self.s3_fs:
-                s3_path = f"s3://{self.s3_bucket}/{parquet_path}"
-                self.s3_fs.put(str(parquet_path), s3_path)
-                self.logger.info(f"Uploaded to S3: {s3_path}")
+                try:
+                    s3_path = f"s3://{self.s3_bucket}/{parquet_path}"
+                    self.s3_fs.put(str(parquet_path), s3_path)
+                    self.logger.info(f"Uploaded to S3: {s3_path}")
+                except Exception as e:
+                    self.logger.error(f"Failed to upload to S3: {e}")
+                    # Don't raise here - S3 upload failure shouldn't stop the process
             
             return True
             
+        except (PermissionError, OSError) as e:
+            self.logger.error(f"Failed to save {table_name}: {e}")
+            raise
         except Exception as e:
             self.logger.error(f"Failed to save {table_name}: {e}")
             return False
@@ -355,6 +382,40 @@ class IcebergConverter:
         
         return sorted(filtered_dockets)
     
+    def check_permissions(self):
+        """Check read/write permissions before starting conversion"""
+        self.logger.info("Checking permissions...")
+        
+        # Check if data directory exists and is readable
+        if not self.data_path.exists():
+            raise FileNotFoundError(f"Data directory does not exist: {self.data_path}")
+        
+        if not os.access(self.data_path, os.R_OK):
+            raise PermissionError(f"No read permission for data directory: {self.data_path}")
+        
+        # Check if we can list the contents
+        try:
+            list(self.data_path.iterdir())
+        except PermissionError as e:
+            raise PermissionError(f"Cannot list contents of data directory {self.data_path}: {e}")
+        
+        # Check output directory permissions
+        if self.output_path.exists():
+            if not os.access(self.output_path, os.W_OK):
+                raise PermissionError(f"No write permission for output directory: {self.output_path}")
+        else:
+            # Try to create the output directory
+            try:
+                self.output_path.mkdir(parents=True, exist_ok=True)
+                # Test write permission by creating a temporary file
+                test_file = self.output_path / ".test_write_permission"
+                test_file.write_text("test")
+                test_file.unlink()
+            except (PermissionError, OSError) as e:
+                raise PermissionError(f"Cannot create or write to output directory {self.output_path}: {e}")
+        
+        self.logger.info("Permission check passed.")
+    
     def print_progress(self, current: int, total: int, start_time: float):
         """Print progress information"""
         elapsed = time.time() - start_time
@@ -375,6 +436,14 @@ class IcebergConverter:
         self.logger.info(f"Output path: {self.output_path}")
         if self.s3_bucket:
             self.logger.info(f"S3 bucket: {self.s3_bucket}")
+        
+        # Check permissions before starting
+        try:
+            self.check_permissions()
+        except (PermissionError, OSError) as e:
+            self.logger.error(f"Permission check failed: {e}")
+            self.logger.error("Please ensure you have read access to the data directory and write access to the output directory.")
+            return
         
         # Get all docket directories
         docket_dirs = self.get_docket_directories()
@@ -404,6 +473,11 @@ class IcebergConverter:
                 if (i + 1) % 100 == 0:
                     self.print_progress(i + 1, total_dockets, start_time)
                 
+            except (PermissionError, OSError) as e:
+                self.logger.error(f"Permission error processing {docket_dir}: {e}")
+                self.logger.error("Stopping conversion due to permission issues.")
+                self.stats['errors'] += 1
+                break
             except Exception as e:
                 self.logger.error(f"Error processing {docket_dir}: {e}")
                 self.stats['errors'] += 1
@@ -416,7 +490,16 @@ class IcebergConverter:
         self.logger.info(f"Dockets processed: {self.stats['dockets_processed']}")
         self.logger.info(f"Dockets skipped: {self.stats['dockets_skipped']}")
         self.logger.info(f"Errors: {self.stats['errors']}")
-        self.logger.info(f"Average rate: {self.stats['dockets_processed']/total_time:.2f} dockets/sec")
+        if self.stats['dockets_processed'] > 0:
+            self.logger.info(f"Average rate: {self.stats['dockets_processed']/total_time:.2f} dockets/sec")
+        
+        # Check if we had permission errors
+        if self.stats['errors'] > 0:
+            self.logger.error("Conversion completed with errors. Check the log for details.")
+            return False
+        else:
+            self.logger.info("Conversion completed successfully!")
+            return True
 
 
 def main():
@@ -445,7 +528,10 @@ def main():
     
     # Run conversion
     try:
-        converter.convert_all()
+        success = converter.convert_all()
+        if not success:
+            print("Conversion completed with errors. Check the log for details.")
+            sys.exit(1)
     except KeyboardInterrupt:
         print("\nConversion interrupted by user")
         sys.exit(1)

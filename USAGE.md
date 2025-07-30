@@ -176,10 +176,24 @@ python convert_to_iceberg.py /path/to/small/test/data --output-path test-output
 
 The script handles errors gracefully:
 
+- **Permission errors** are caught early and provide clear error messages
 - **Individual docket failures** don't stop the entire process
 - **Detailed error logging** in `iceberg_conversion.log`
 - **Statistics tracking** for processed, skipped, and failed dockets
 - **Resumable operation** - can restart from where it left off
+
+### Permission Requirements
+
+The script requires:
+- **Read access** to the data directory and all subdirectories
+- **Write access** to the output directory (will be created if it doesn't exist)
+- **Execute access** to list directory contents
+
+### Common Permission Issues
+
+1. **Read-only mounted drives**: Ensure the output directory is on a writable filesystem
+2. **Insufficient permissions**: Run with appropriate user permissions or use `sudo`
+3. **SELinux/AppArmor**: Check if security policies are blocking file access
 
 ## S3 Configuration
 
@@ -251,17 +265,23 @@ The script flattens nested JSON structures:
    - Ensure raw-data directory exists
    - Verify agency/docket directory structure
 
-2. **Memory errors**
+2. **Permission errors**
+   - Check read access to data directory
+   - Check write access to output directory
+   - Ensure output directory is on a writable filesystem
+   - Use `--output-path` to specify a writable location
+
+3. **Memory errors**
    - Reduce batch size (not currently configurable)
    - Use faster compression (lz4)
    - Process smaller subsets
 
-3. **S3 upload failures**
+4. **S3 upload failures**
    - Check AWS credentials
    - Verify S3 bucket permissions
    - Check network connectivity
 
-4. **Slow performance**
+5. **Slow performance**
    - Use SSD storage for local processing
    - Consider faster compression (lz4)
    - Process during off-peak hours
@@ -312,4 +332,19 @@ python convert_to_iceberg.py /path/to/full/data \
 python convert_to_iceberg.py /path/to/new/data \
     --output-path derived-data \
     --s3-bucket my-bucket
+```
+
+### Read-Only Environments
+
+If your data is on a read-only filesystem:
+
+```bash
+# Specify a writable output location
+python convert_to_iceberg.py /readonly/data/path --output-path /writable/output/path
+
+# Use current directory (if writable)
+python convert_to_iceberg.py /readonly/data/path --output-path .
+
+# Use S3 for output
+python convert_to_iceberg.py /readonly/data/path --s3-bucket my-bucket
 ``` 
