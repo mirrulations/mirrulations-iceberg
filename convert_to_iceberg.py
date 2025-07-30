@@ -49,7 +49,7 @@ class IcebergConverter:
         
         # Setup logging
         logging.basicConfig(
-            level=logging.INFO,
+            level=logging.DEBUG,
             format='%(asctime)s - %(levelname)s - %(message)s',
             handlers=[
                 logging.FileHandler('iceberg_conversion.log'),
@@ -202,7 +202,12 @@ class IcebergConverter:
         # Debug: Check what directories exist
         self.logger.debug(f"  Docket path: {docket_path}")
         if docket_path.exists():
-            self.logger.debug(f"  Contents: {[d.name for d in docket_path.iterdir() if d.is_dir()]}")
+            contents = [d.name for d in docket_path.iterdir() if d.is_dir()]
+            self.logger.debug(f"  Contents: {contents}")
+            # Also log if we find text-* directories
+            text_dirs = [d.name for d in docket_path.iterdir() if d.is_dir() and d.name.startswith('text-')]
+            if text_dirs:
+                self.logger.debug(f"  Found text-* directories: {text_dirs}")
         else:
             self.logger.warning(f"  Docket path does not exist: {docket_path}")
             return result
@@ -228,6 +233,21 @@ class IcebergConverter:
                         if docket_data:
                             result['docket_info'] = self.flatten_docket_data(docket_data)
                             break
+                
+                # NEW: Try the text-* subdirectory structure
+                if result['docket_info'] is None:
+                    text_subdirs = [d for d in raw_data_path.iterdir() if d.is_dir() and d.name.startswith('text-')]
+                    if text_subdirs:
+                        self.logger.debug(f"  Trying text-* subdirectories: {[d.name for d in text_subdirs]}")
+                    for text_subdir in text_subdirs:
+                        docket_file = text_subdir / "docket" / f"{docket_id}.json"
+                        self.logger.debug(f"  Checking for docket file: {docket_file}")
+                        if docket_file.exists():
+                            self.logger.debug(f"  Found docket file: {docket_file}")
+                            docket_data = self.load_json_file(docket_file)
+                            if docket_data:
+                                result['docket_info'] = self.flatten_docket_data(docket_data)
+                                break
             
             # Process documents
             documents_dir = raw_data_path / "documents"
@@ -238,6 +258,21 @@ class IcebergConverter:
                         flattened_doc = self.flatten_document_data(doc_data)
                         result['documents'].append(flattened_doc)
             
+            # NEW: Try the text-* subdirectory structure for documents
+            if not result['documents']:
+                text_subdirs = [d for d in raw_data_path.iterdir() if d.is_dir() and d.name.startswith('text-')]
+                if text_subdirs:
+                    self.logger.debug(f"  Trying text-* subdirectories for documents: {[d.name for d in text_subdirs]}")
+                for text_subdir in text_subdirs:
+                    documents_dir = text_subdir / "documents"
+                    if documents_dir.exists():
+                        self.logger.debug(f"  Found documents directory: {documents_dir}")
+                        for doc_file in documents_dir.glob("*.json"):
+                            doc_data = self.load_json_file(doc_file)
+                            if doc_data:
+                                flattened_doc = self.flatten_document_data(doc_data)
+                                result['documents'].append(flattened_doc)
+            
             # Process comments
             comments_dir = raw_data_path / "comments"
             if comments_dir.exists():
@@ -246,6 +281,21 @@ class IcebergConverter:
                     if comment_data:
                         flattened_comment = self.flatten_comment_data(comment_data)
                         result['comments'].append(flattened_comment)
+            
+            # NEW: Try the text-* subdirectory structure for comments
+            if not result['comments']:
+                text_subdirs = [d for d in raw_data_path.iterdir() if d.is_dir() and d.name.startswith('text-')]
+                if text_subdirs:
+                    self.logger.debug(f"  Trying text-* subdirectories for comments: {[d.name for d in text_subdirs]}")
+                for text_subdir in text_subdirs:
+                    comments_dir = text_subdir / "comments"
+                    if comments_dir.exists():
+                        self.logger.debug(f"  Found comments directory: {comments_dir}")
+                        for comment_file in comments_dir.glob("*.json"):
+                            comment_data = self.load_json_file(comment_file)
+                            if comment_data:
+                                flattened_comment = self.flatten_comment_data(comment_data)
+                                result['comments'].append(flattened_comment)
         
         # Also check for direct structure (fallback)
         else:
@@ -267,6 +317,17 @@ class IcebergConverter:
                         if docket_data:
                             result['docket_info'] = self.flatten_docket_data(docket_data)
                             break
+                
+                # NEW: Try the text-* subdirectory structure
+                if result['docket_info'] is None:
+                    text_subdirs = [d for d in docket_path.iterdir() if d.is_dir() and d.name.startswith('text-')]
+                    for text_subdir in text_subdirs:
+                        docket_file = text_subdir / "docket" / f"{docket_id}.json"
+                        if docket_file.exists():
+                            docket_data = self.load_json_file(docket_file)
+                            if docket_data:
+                                result['docket_info'] = self.flatten_docket_data(docket_data)
+                                break
             
             # Process documents
             documents_dir = docket_path / "documents"
@@ -277,6 +338,18 @@ class IcebergConverter:
                         flattened_doc = self.flatten_document_data(doc_data)
                         result['documents'].append(flattened_doc)
             
+            # NEW: Try the text-* subdirectory structure for documents
+            if not result['documents']:
+                text_subdirs = [d for d in docket_path.iterdir() if d.is_dir() and d.name.startswith('text-')]
+                for text_subdir in text_subdirs:
+                    documents_dir = text_subdir / "documents"
+                    if documents_dir.exists():
+                        for doc_file in documents_dir.glob("*.json"):
+                            doc_data = self.load_json_file(doc_file)
+                            if doc_data:
+                                flattened_doc = self.flatten_document_data(doc_data)
+                                result['documents'].append(flattened_doc)
+            
             # Process comments
             comments_dir = docket_path / "comments"
             if comments_dir.exists():
@@ -285,6 +358,18 @@ class IcebergConverter:
                     if comment_data:
                         flattened_comment = self.flatten_comment_data(comment_data)
                         result['comments'].append(flattened_comment)
+            
+            # NEW: Try the text-* subdirectory structure for comments
+            if not result['comments']:
+                text_subdirs = [d for d in docket_path.iterdir() if d.is_dir() and d.name.startswith('text-')]
+                for text_subdir in text_subdirs:
+                    comments_dir = text_subdir / "comments"
+                    if comments_dir.exists():
+                        for comment_file in comments_dir.glob("*.json"):
+                            comment_data = self.load_json_file(comment_file)
+                            if comment_data:
+                                flattened_comment = self.flatten_comment_data(comment_data)
+                                result['comments'].append(flattened_comment)
         
         # Debug: Log what data was found
         self.logger.debug(f"  Found: docket_info={result['docket_info'] is not None}, "
