@@ -21,6 +21,7 @@ from typing import Dict, List, Any, Optional
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+from tqdm import tqdm
 import logging
 from datetime import datetime
 
@@ -540,7 +541,7 @@ class IcebergConverter:
         
         self.logger.info("Permission check passed.")
     
-    def __init__(self, data_path: str, output_path: str = None, s3_bucket: str = None, debug: bool = False):
+    def __init__(self, data_path: str, output_path: str = None, s3_bucket: str = None, debug: bool = False, verbose: bool = False):
         self.data_path = Path(data_path)
         # If no output path specified, create derived-data inside the data_path directory
         if output_path:
@@ -552,9 +553,10 @@ class IcebergConverter:
         self.s3_bucket = s3_bucket
         self.s3_client = None
         self.s3_fs = None
+        self.verbose = verbose
         
         # Setup logging
-        log_level = logging.DEBUG if debug else logging.INFO
+        log_level = logging.DEBUG if debug else (logging.INFO if verbose else logging.WARNING)
         logging.basicConfig(
             level=log_level,
             format='%(asctime)s - %(levelname)s - %(message)s',
@@ -576,51 +578,16 @@ class IcebergConverter:
             'errors': 0,
             'start_time': time.time()
         }
-        
-        # Progress display
-        self.last_progress_update = 0
-        self.progress_line_length = 0
     
-    def update_progress_display(self, current: int, total: int, start_time: float, force_update: bool = False):
-        """Update progress display on a single line"""
-        # Only update every 10 dockets or if forced
-        if not force_update and current - self.last_progress_update < 10:
-            return
-        
-        elapsed = time.time() - start_time
-        if current > 0:
-            rate = current / elapsed
-            eta = (total - current) / rate if rate > 0 else 0
-            
-            # Create progress bar
-            bar_length = 30
-            filled_length = int(bar_length * current // total)
-            bar = '█' * filled_length + '-' * (bar_length - filled_length)
-            
-            # Create status message
-            status_msg = (
-                f"Converting dockets: [{bar}] {current}/{total} ({current/total*100:.1f}%) | "
-                f"Rate: {rate:.1f}/s | Elapsed: {elapsed/3600:.1f}h | ETA: {eta/3600:.1f}h | "
-                f"Processed: {self.stats['dockets_processed']} | Skipped: {self.stats['dockets_skipped']} | Errors: {self.stats['errors']}"
-            )
-            
-            # Clear previous line and print new status
-            print(f"\r{status_msg}", end='', flush=True)
-            self.progress_line_length = len(status_msg)
-            self.last_progress_update = current
-    
-    def clear_progress_display(self):
-        """Clear the progress display line"""
-        if self.progress_line_length > 0:
-            print(f"\r{' ' * self.progress_line_length}\r", end='', flush=True)
-            self.progress_line_length = 0
+
     
     def convert_all(self):
         """Convert all dockets to Iceberg format"""
-        print(f"Starting conversion from: {self.data_path}")
-        print(f"Output path: {self.output_path}")
-        if self.s3_bucket:
-            print(f"S3 bucket: {self.s3_bucket}")
+        if self.verbose:
+            self.logger.info(f"Starting conversion from: {self.data_path}")
+            self.logger.info(f"Output path: {self.output_path}")
+            if self.s3_bucket:
+                self.logger.info(f"S3 bucket: {self.s3_bucket}")
         
         # Check permissions before starting
         try:
@@ -634,7 +601,8 @@ class IcebergConverter:
         docket_dirs = self.get_docket_directories()
         total_dockets = len(docket_dirs)
         
-        print(f"Found {total_dockets} dockets to process")
+        if self.verbose:
+            self.logger.info(f"Found {total_dockets} dockets to process")
         
         if total_dockets == 0:
             self.logger.error("No dockets found. Check the data path structure.")
@@ -642,36 +610,36 @@ class IcebergConverter:
         
         start_time = time.time()
         
-        # Process each docket
-        for i, docket_dir in enumerate(docket_dirs):
-            try:
-                # Process docket
-                docket_data = self.process_docket(docket_dir)
-                
-                # Save dataset
-                if self.save_docket_dataset(docket_data):
-                    self.stats['dockets_processed'] += 1
-                else:
-                    self.stats['dockets_skipped'] += 1
-                
-                # Update progress display
-                self.update_progress_display(i + 1, total_dockets, start_time)
-                
-            except (PermissionError, OSError) as e:
-                self.logger.error(f"Permission error processing {docket_dir}: {e}")
-                self.logger.error("Stopping conversion due to permission issues.")
-                self.stats['errors'] += 1
-                break
-            except Exception as e:
-                self.logger.error(f"Error processing {docket_dir}: {e}")
-                self.stats['errors'] += 1
-                continue
+        # Process each docket with tqdm progress bar
+        with tqdm(docket_dirs, desc="Converting dockets", unit="docket") as pbar:
+            for docket_dir in pbar:
+                try:
+                    # Update progress bar description with current docket
+                    docket_name = docket_dir.name
+                    pbar.set_description(f"Converting {docket_name}")
+                    
+                    # Process docket
+                    docket_data = self.process_docket(docket_dir)
+                    
+                    # Save dataset
+                    if self.save_docket_dataset(docket_data):
+                        self.stats['dockets_processed'] += 1
+                    else:
+                        self.stats['dockets_skipped'] += 1
+                    
+                except (PermissionError, OSError) as e:
+                    self.logger.error(f"Permission error processing {docket_dir}: {e}")
+                    self.logger.error("Stopping conversion due to permission issues.")
+                    self.stats['errors'] += 1
+                    break
+                except Exception as e:
+                    self.logger.error(f"Error processing {docket_dir}: {e}")
+                    self.stats['errors'] += 1
+                    continue
         
-        # Clear progress display and show final statistics
-        self.clear_progress_display()
+        # Final statistics
         total_time = time.time() - start_time
-        
-        print(f"Conversion complete!")
+        print(f"\nConversion complete!")
         print(f"Total time: {total_time/3600:.2f} hours")
         print(f"Dockets processed: {self.stats['dockets_processed']}")
         print(f"Dockets skipped: {self.stats['dockets_skipped']}")
@@ -699,6 +667,8 @@ def main():
                        help="Compression algorithm for Parquet files")
     parser.add_argument("--debug", action="store_true", 
                        help="Enable debug logging for troubleshooting")
+    parser.add_argument("--verbose", action="store_true", 
+                       help="Enable verbose INFO output")
     
     args = parser.parse_args()
     
@@ -712,7 +682,8 @@ def main():
         data_path=args.data_path,
         output_path=args.output_path,
         s3_bucket=args.s3_bucket,
-        debug=args.debug
+        debug=args.debug,
+        verbose=args.verbose
     )
     
     # Run conversion
