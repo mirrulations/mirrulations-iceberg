@@ -177,7 +177,7 @@ class IcebergConverter:
             self.logger.warning(f"Failed to load {file_path}: {e}")
             return None
     
-    def process_docket(self, docket_path: Path) -> Dict[str, Any]:
+    def process_docket(self, docket_path: Path, outer_pbar=None) -> Dict[str, Any]:
         """Process a single docket directory"""
         docket_id = docket_path.name
         
@@ -190,7 +190,8 @@ class IcebergConverter:
         else:
             agency = "UNKNOWN"
         
-        self.logger.info(f"Processing docket: {agency}/{docket_id}")
+        if self.verbose:
+            self.logger.info(f"Processing docket: {agency}/{docket_id}")
         
         result = {
             'docket_info': None,
@@ -277,11 +278,21 @@ class IcebergConverter:
             # Process comments
             comments_dir = raw_data_path / "comments"
             if comments_dir.exists():
-                for comment_file in comments_dir.glob("*.json"):
-                    comment_data = self.load_json_file(comment_file)
-                    if comment_data:
-                        flattened_comment = self.flatten_comment_data(comment_data)
-                        result['comments'].append(flattened_comment)
+                comment_files = list(comments_dir.glob("*.json"))
+                if len(comment_files) > self.comment_threshold and outer_pbar:  # Only show nested bar for dockets with many comments
+                    with tqdm(comment_files, desc=f"  Processing {len(comment_files)} comments", 
+                             leave=False, position=1) as comment_pbar:
+                        for comment_file in comment_pbar:
+                            comment_data = self.load_json_file(comment_file)
+                            if comment_data:
+                                flattened_comment = self.flatten_comment_data(comment_data)
+                                result['comments'].append(flattened_comment)
+                else:
+                    for comment_file in comment_files:
+                        comment_data = self.load_json_file(comment_file)
+                        if comment_data:
+                            flattened_comment = self.flatten_comment_data(comment_data)
+                            result['comments'].append(flattened_comment)
             
             # NEW: Try the text-* subdirectory structure for comments
             if not result['comments']:
@@ -292,11 +303,21 @@ class IcebergConverter:
                     comments_dir = text_subdir / "comments"
                     if comments_dir.exists():
                         self.logger.debug(f"  Found comments directory: {comments_dir}")
-                        for comment_file in comments_dir.glob("*.json"):
-                            comment_data = self.load_json_file(comment_file)
-                            if comment_data:
-                                flattened_comment = self.flatten_comment_data(comment_data)
-                                result['comments'].append(flattened_comment)
+                        comment_files = list(comments_dir.glob("*.json"))
+                        if len(comment_files) > self.comment_threshold and outer_pbar:  # Only show nested bar for dockets with many comments
+                            with tqdm(comment_files, desc=f"  Processing {len(comment_files)} comments", 
+                                     leave=False, position=1) as comment_pbar:
+                                for comment_file in comment_pbar:
+                                    comment_data = self.load_json_file(comment_file)
+                                    if comment_data:
+                                        flattened_comment = self.flatten_comment_data(comment_data)
+                                        result['comments'].append(flattened_comment)
+                        else:
+                            for comment_file in comment_files:
+                                comment_data = self.load_json_file(comment_file)
+                                if comment_data:
+                                    flattened_comment = self.flatten_comment_data(comment_data)
+                                    result['comments'].append(flattened_comment)
         
         # Also check for direct structure (fallback)
         else:
@@ -354,11 +375,21 @@ class IcebergConverter:
             # Process comments
             comments_dir = docket_path / "comments"
             if comments_dir.exists():
-                for comment_file in comments_dir.glob("*.json"):
-                    comment_data = self.load_json_file(comment_file)
-                    if comment_data:
-                        flattened_comment = self.flatten_comment_data(comment_data)
-                        result['comments'].append(flattened_comment)
+                comment_files = list(comments_dir.glob("*.json"))
+                if len(comment_files) > self.comment_threshold and outer_pbar:  # Only show nested bar for dockets with many comments
+                    with tqdm(comment_files, desc=f"  Processing {len(comment_files)} comments", 
+                             leave=False, position=1) as comment_pbar:
+                        for comment_file in comment_pbar:
+                            comment_data = self.load_json_file(comment_file)
+                            if comment_data:
+                                flattened_comment = self.flatten_comment_data(comment_data)
+                                result['comments'].append(flattened_comment)
+                else:
+                    for comment_file in comment_files:
+                        comment_data = self.load_json_file(comment_file)
+                        if comment_data:
+                            flattened_comment = self.flatten_comment_data(comment_data)
+                            result['comments'].append(flattened_comment)
             
             # NEW: Try the text-* subdirectory structure for comments
             if not result['comments']:
@@ -366,11 +397,21 @@ class IcebergConverter:
                 for text_subdir in text_subdirs:
                     comments_dir = text_subdir / "comments"
                     if comments_dir.exists():
-                        for comment_file in comments_dir.glob("*.json"):
-                            comment_data = self.load_json_file(comment_file)
-                            if comment_data:
-                                flattened_comment = self.flatten_comment_data(comment_data)
-                                result['comments'].append(flattened_comment)
+                        comment_files = list(comments_dir.glob("*.json"))
+                        if len(comment_files) > self.comment_threshold and outer_pbar:  # Only show nested bar for dockets with many comments
+                            with tqdm(comment_files, desc=f"  Processing {len(comment_files)} comments", 
+                                     leave=False, position=1) as comment_pbar:
+                                for comment_file in comment_pbar:
+                                    comment_data = self.load_json_file(comment_file)
+                                    if comment_data:
+                                        flattened_comment = self.flatten_comment_data(comment_data)
+                                        result['comments'].append(flattened_comment)
+                        else:
+                            for comment_file in comment_files:
+                                comment_data = self.load_json_file(comment_file)
+                                if comment_data:
+                                    flattened_comment = self.flatten_comment_data(comment_data)
+                                    result['comments'].append(flattened_comment)
         
         # Debug: Log what data was found
         self.logger.debug(f"  Found: docket_info={result['docket_info'] is not None}, "
@@ -541,7 +582,7 @@ class IcebergConverter:
         
         self.logger.info("Permission check passed.")
     
-    def __init__(self, data_path: str, output_path: str = None, s3_bucket: str = None, debug: bool = False, verbose: bool = False):
+    def __init__(self, data_path: str, output_path: str = None, s3_bucket: str = None, debug: bool = False, verbose: bool = False, comment_threshold: int = 10):
         self.data_path = Path(data_path)
         # If no output path specified, create derived-data inside the data_path directory
         if output_path:
@@ -554,6 +595,7 @@ class IcebergConverter:
         self.s3_client = None
         self.s3_fs = None
         self.verbose = verbose
+        self.comment_threshold = comment_threshold
         
         # Setup logging
         log_level = logging.DEBUG if debug else (logging.INFO if verbose else logging.WARNING)
@@ -611,7 +653,7 @@ class IcebergConverter:
         start_time = time.time()
         
         # Process each docket with tqdm progress bar
-        with tqdm(docket_dirs, desc="Converting dockets", unit="docket") as pbar:
+        with tqdm(docket_dirs, desc="Converting dockets", unit="docket", position=0) as pbar:
             for docket_dir in pbar:
                 try:
                     # Update progress bar description with current docket
@@ -619,7 +661,7 @@ class IcebergConverter:
                     pbar.set_description(f"Converting {docket_name}")
                     
                     # Process docket
-                    docket_data = self.process_docket(docket_dir)
+                    docket_data = self.process_docket(docket_dir, outer_pbar=pbar)
                     
                     # Save dataset
                     if self.save_docket_dataset(docket_data):
@@ -669,6 +711,8 @@ def main():
                        help="Enable debug logging for troubleshooting")
     parser.add_argument("--verbose", action="store_true", 
                        help="Enable verbose INFO output")
+    parser.add_argument("--comment-threshold", type=int, default=10,
+                       help="Number of comments above which to show nested progress bar (default: 10)")
     
     args = parser.parse_args()
     
@@ -683,7 +727,8 @@ def main():
         output_path=args.output_path,
         s3_bucket=args.s3_bucket,
         debug=args.debug,
-        verbose=args.verbose
+        verbose=args.verbose,
+        comment_threshold=args.comment_threshold
     )
     
     # Run conversion
