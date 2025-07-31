@@ -21,7 +21,6 @@ from typing import Dict, List, Any, Optional
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
-from tqdm import tqdm
 import logging
 from datetime import datetime
 
@@ -541,26 +540,87 @@ class IcebergConverter:
         
         self.logger.info("Permission check passed.")
     
-    def print_progress(self, current: int, total: int, start_time: float):
-        """Print progress information"""
+    def __init__(self, data_path: str, output_path: str = None, s3_bucket: str = None, debug: bool = False):
+        self.data_path = Path(data_path)
+        # If no output path specified, create derived-data inside the data_path directory
+        if output_path:
+            self.output_path = Path(output_path).resolve()
+            self.use_derived_data_subdir = True  # Need to create derived-data/ subdirectory
+        else:
+            self.output_path = self.data_path / "derived-data"
+            self.use_derived_data_subdir = False  # Already pointing to derived-data directory
+        self.s3_bucket = s3_bucket
+        self.s3_client = None
+        self.s3_fs = None
+        
+        # Setup logging
+        log_level = logging.DEBUG if debug else logging.INFO
+        logging.basicConfig(
+            level=log_level,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler('iceberg_conversion.log'),
+                logging.StreamHandler()
+            ]
+        )
+        self.logger = logging.getLogger(__name__)
+        
+        # Setup S3 if specified
+        if s3_bucket:
+            self.setup_s3()
+        
+        # Statistics
+        self.stats = {
+            'dockets_processed': 0,
+            'dockets_skipped': 0,
+            'errors': 0,
+            'start_time': time.time()
+        }
+        
+        # Progress display
+        self.last_progress_update = 0
+        self.progress_line_length = 0
+    
+    def update_progress_display(self, current: int, total: int, start_time: float, force_update: bool = False):
+        """Update progress display on a single line"""
+        # Only update every 10 dockets or if forced
+        if not force_update and current - self.last_progress_update < 10:
+            return
+        
         elapsed = time.time() - start_time
         if current > 0:
             rate = current / elapsed
             eta = (total - current) / rate if rate > 0 else 0
             
-            self.logger.info(
-                f"Progress: {current}/{total} ({current/total*100:.1f}%) "
-                f"Rate: {rate:.2f} dockets/sec "
-                f"Elapsed: {elapsed/3600:.1f}h "
-                f"ETA: {eta/3600:.1f}h"
+            # Create progress bar
+            bar_length = 30
+            filled_length = int(bar_length * current // total)
+            bar = '█' * filled_length + '-' * (bar_length - filled_length)
+            
+            # Create status message
+            status_msg = (
+                f"Converting dockets: [{bar}] {current}/{total} ({current/total*100:.1f}%) | "
+                f"Rate: {rate:.1f}/s | Elapsed: {elapsed/3600:.1f}h | ETA: {eta/3600:.1f}h | "
+                f"Processed: {self.stats['dockets_processed']} | Skipped: {self.stats['dockets_skipped']} | Errors: {self.stats['errors']}"
             )
+            
+            # Clear previous line and print new status
+            print(f"\r{status_msg}", end='', flush=True)
+            self.progress_line_length = len(status_msg)
+            self.last_progress_update = current
+    
+    def clear_progress_display(self):
+        """Clear the progress display line"""
+        if self.progress_line_length > 0:
+            print(f"\r{' ' * self.progress_line_length}\r", end='', flush=True)
+            self.progress_line_length = 0
     
     def convert_all(self):
         """Convert all dockets to Iceberg format"""
-        self.logger.info(f"Starting conversion from: {self.data_path}")
-        self.logger.info(f"Output path: {self.output_path}")
+        print(f"Starting conversion from: {self.data_path}")
+        print(f"Output path: {self.output_path}")
         if self.s3_bucket:
-            self.logger.info(f"S3 bucket: {self.s3_bucket}")
+            print(f"S3 bucket: {self.s3_bucket}")
         
         # Check permissions before starting
         try:
@@ -574,7 +634,7 @@ class IcebergConverter:
         docket_dirs = self.get_docket_directories()
         total_dockets = len(docket_dirs)
         
-        self.logger.info(f"Found {total_dockets} dockets to process")
+        print(f"Found {total_dockets} dockets to process")
         
         if total_dockets == 0:
             self.logger.error("No dockets found. Check the data path structure.")
@@ -583,7 +643,7 @@ class IcebergConverter:
         start_time = time.time()
         
         # Process each docket
-        for i, docket_dir in enumerate(tqdm(docket_dirs, desc="Converting dockets")):
+        for i, docket_dir in enumerate(docket_dirs):
             try:
                 # Process docket
                 docket_data = self.process_docket(docket_dir)
@@ -594,9 +654,8 @@ class IcebergConverter:
                 else:
                     self.stats['dockets_skipped'] += 1
                 
-                # Print progress every 100 dockets
-                if (i + 1) % 100 == 0:
-                    self.print_progress(i + 1, total_dockets, start_time)
+                # Update progress display
+                self.update_progress_display(i + 1, total_dockets, start_time)
                 
             except (PermissionError, OSError) as e:
                 self.logger.error(f"Permission error processing {docket_dir}: {e}")
@@ -608,22 +667,24 @@ class IcebergConverter:
                 self.stats['errors'] += 1
                 continue
         
-        # Final statistics
+        # Clear progress display and show final statistics
+        self.clear_progress_display()
         total_time = time.time() - start_time
-        self.logger.info(f"\nConversion complete!")
-        self.logger.info(f"Total time: {total_time/3600:.2f} hours")
-        self.logger.info(f"Dockets processed: {self.stats['dockets_processed']}")
-        self.logger.info(f"Dockets skipped: {self.stats['dockets_skipped']}")
-        self.logger.info(f"Errors: {self.stats['errors']}")
+        
+        print(f"Conversion complete!")
+        print(f"Total time: {total_time/3600:.2f} hours")
+        print(f"Dockets processed: {self.stats['dockets_processed']}")
+        print(f"Dockets skipped: {self.stats['dockets_skipped']}")
+        print(f"Errors: {self.stats['errors']}")
         if self.stats['dockets_processed'] > 0:
-            self.logger.info(f"Average rate: {self.stats['dockets_processed']/total_time:.2f} dockets/sec")
+            print(f"Average rate: {self.stats['dockets_processed']/total_time:.2f} dockets/sec")
         
         # Check if we had permission errors
         if self.stats['errors'] > 0:
             self.logger.error("Conversion completed with errors. Check the log for details.")
             return False
         else:
-            self.logger.info("Conversion completed successfully!")
+            print("Conversion completed successfully!")
             return True
 
 
