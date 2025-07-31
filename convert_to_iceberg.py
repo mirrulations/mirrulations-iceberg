@@ -34,7 +34,7 @@ import s3fs
 class IcebergConverter:
     """Convert Mirrulations data to Iceberg format"""
     
-    def __init__(self, data_path: str, output_path: str = None, s3_bucket: str = None):
+    def __init__(self, data_path: str, output_path: str = None, s3_bucket: str = None, debug: bool = False):
         self.data_path = Path(data_path)
         # If no output path specified, create derived-data inside the data_path directory
         if output_path:
@@ -48,8 +48,9 @@ class IcebergConverter:
         self.s3_fs = None
         
         # Setup logging
+        log_level = logging.DEBUG if debug else logging.INFO
         logging.basicConfig(
-            level=logging.DEBUG,
+            level=log_level,
             format='%(asctime)s - %(levelname)s - %(message)s',
             handlers=[
                 logging.FileHandler('iceberg_conversion.log'),
@@ -635,6 +636,8 @@ def main():
     parser.add_argument("--compression", default="snappy", 
                        choices=["snappy", "gzip", "brotli", "lz4"],
                        help="Compression algorithm for Parquet files")
+    parser.add_argument("--debug", action="store_true", 
+                       help="Enable debug logging for troubleshooting")
     
     args = parser.parse_args()
     
@@ -647,7 +650,8 @@ def main():
     converter = IcebergConverter(
         data_path=args.data_path,
         output_path=args.output_path,
-        s3_bucket=args.s3_bucket
+        s3_bucket=args.s3_bucket,
+        debug=args.debug
     )
     
     # Run conversion
