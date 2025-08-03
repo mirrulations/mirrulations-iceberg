@@ -142,6 +142,10 @@ class IcebergConverter:
             'errors': 0,
             'start_time': time.time()
         }
+        
+        # Filters for processing specific agencies or dockets
+        self.agency_filter = None
+        self.docket_pattern_filter = None
     
     def setup_s3(self):
         """Setup S3 filesystem"""
@@ -703,44 +707,62 @@ class IcebergConverter:
         return success
     
     def get_docket_directories(self) -> List[str]:
-        """Get all docket directories from the data path"""
+        """Get all docket directories from the data path using known Mirrulations structure"""
         dockets = []
         
         # Look for raw-data structure (Mirrulations format)
         raw_data_path = self.join_paths(self.data_path, "raw-data")
         self.logger.info(f"Checking for raw-data structure at: {raw_data_path}")
+        
         if self.path_exists(raw_data_path):
             self.logger.info(f"Found raw-data structure at {raw_data_path}")
-            agency_dirs = self.list_directory(raw_data_path)
-            self.logger.info(f"Found {len(agency_dirs)} agency directories: {agency_dirs[:5]}...")
             
-            for agency_dir in agency_dirs:
-                agency_path = self.join_paths(raw_data_path, agency_dir)
-                if self.is_directory(agency_path):
-                    self.logger.debug(f"  Agency: {agency_dir}")
-                    docket_dirs = self.list_directory(agency_path)
-                    self.logger.debug(f"    Found {len(docket_dirs)} dockets in {agency_dir}")
-                    for docket_dir in docket_dirs:
-                        docket_path = self.join_paths(agency_path, docket_dir)
-                        if self.is_directory(docket_path):
-                            dockets.append(docket_path)
-                            self.logger.debug(f"      Docket: {docket_dir}")
+            # For S3, we'll use a more efficient approach based on known structure
+            if self.is_s3_source:
+                self.logger.info("Using optimized S3 scanning based on known Mirrulations structure...")
+                dockets = self._get_dockets_from_s3_optimized(raw_data_path)
+            else:
+                # For local paths, use the original directory scanning
+                self.logger.info("Scanning agency directories...")
+                agency_dirs = self.list_directory(raw_data_path)
+                self.logger.info(f"Found {len(agency_dirs)} agency directories")
+                
+                # Show progress for agency scanning
+                with tqdm(agency_dirs, desc="Scanning agencies", unit="agency") as pbar:
+                    for agency_dir in pbar:
+                        pbar.set_description(f"Scanning {agency_dir}")
+                        agency_path = self.join_paths(raw_data_path, agency_dir)
+                        if self.is_directory(agency_path):
+                            self.logger.debug(f"  Agency: {agency_dir}")
+                            docket_dirs = self.list_directory(agency_path)
+                            self.logger.debug(f"    Found {len(docket_dirs)} dockets in {agency_dir}")
+                            for docket_dir in docket_dirs:
+                                docket_path = self.join_paths(agency_path, docket_dir)
+                                if self.is_directory(docket_path):
+                                    dockets.append(docket_path)
+                                    self.logger.debug(f"      Docket: {docket_dir}")
         else:
             self.logger.info(f"No raw-data structure found at {raw_data_path}")
             # Look for direct docket structure (like in results/)
             self.logger.info(f"Looking for direct docket structure in {self.data_path}")
-            data_contents = self.list_directory(self.data_path)
-            self.logger.info(f"Found {len(data_contents)} items in data path: {data_contents[:5]}...")
+            self.logger.info("Scanning data directory...")
             
-            for docket_dir in data_contents:
-                docket_path = self.join_paths(self.data_path, docket_dir)
-                if self.is_directory(docket_path) and not PathHandler.get_name(docket_path).startswith('.'):
-                    # Check if this looks like a docket directory
-                    if self.path_exists(self.join_paths(docket_path, "raw-data")) or self.path_exists(self.join_paths(docket_path, "docket")):
-                        dockets.append(docket_path)
-                        self.logger.debug(f"  Found docket: {PathHandler.get_name(docket_path)}")
+            data_contents = self.list_directory(self.data_path)
+            self.logger.info(f"Found {len(data_contents)} items in data path")
+            
+            # Show progress for direct structure scanning
+            with tqdm(data_contents, desc="Scanning dockets", unit="item") as pbar:
+                for docket_dir in pbar:
+                    pbar.set_description(f"Checking {docket_dir}")
+                    docket_path = self.join_paths(self.data_path, docket_dir)
+                    if self.is_directory(docket_path) and not PathHandler.get_name(docket_path).startswith('.'):
+                        # Check if this looks like a docket directory
+                        if self.path_exists(self.join_paths(docket_path, "raw-data")) or self.path_exists(self.join_paths(docket_path, "docket")):
+                            dockets.append(docket_path)
+                            self.logger.debug(f"  Found docket: {PathHandler.get_name(docket_path)}")
         
         # Filter out non-docket directories and sort
+        self.logger.info("Filtering docket directories...")
         filtered_dockets = []
         for docket in dockets:
             # Skip derived-data and other non-docket directories
@@ -749,6 +771,104 @@ class IcebergConverter:
         
         self.logger.info(f"Found {len(filtered_dockets)} docket directories after filtering")
         return sorted(filtered_dockets)
+    
+    def _get_dockets_from_s3_optimized(self, raw_data_path: str) -> List[str]:
+        """Get docket directories from S3 using optimized approach based on known structure"""
+        dockets = []
+        
+        # Known agency prefixes from Mirrulations structure
+        # This is a subset - we can expand this list as needed
+        known_agencies = [
+            'ABMC', 'ACF', 'ACFR', 'ACHP', 'ACL', 'ACUS', 'ADF', 'AFRH', 'AHRQ', 'AID',
+            'AMS', 'APHIS', 'ATF', 'BIA', 'BLM', 'BLS', 'BOP', 'BSEE', 'BTS', 'CBP',
+            'CDC', 'CFPB', 'CMS', 'CNCS', 'CPSC', 'CRS', 'DARS', 'DEA', 'DHS', 'DOC',
+            'DOD', 'DOE', 'DOI', 'DOJ', 'DOL', 'DOS', 'DOT', 'ED', 'EPA', 'FAA',
+            'FBI', 'FCC', 'FDA', 'FDIC', 'FHFA', 'FISC', 'FLRA', 'FMCSA', 'FRA', 'FRB',
+            'FTC', 'GAO', 'GSA', 'HHS', 'HUD', 'ICE', 'IRS', 'ITC', 'NASA', 'NEA',
+            'NFA', 'NGA', 'NIGC', 'NIH', 'NIST', 'NOAA', 'NPS', 'NRC', 'NSA', 'NSF',
+            'NTSB', 'OCC', 'ODNI', 'OGE', 'OMB', 'ONRR', 'OPM', 'OSHA', 'PBGC', 'PTO',
+            'SEC', 'SBA', 'SSA', 'SSS', 'TREAS', 'TSA', 'USCIS', 'USDA', 'USGS', 'VA'
+        ]
+        
+        # Apply agency filter if specified
+        if self.agency_filter:
+            if self.agency_filter in known_agencies:
+                known_agencies = [self.agency_filter]
+                self.logger.info(f"Filtering to single agency: {self.agency_filter}")
+            else:
+                self.logger.warning(f"Agency filter '{self.agency_filter}' not in known agencies list")
+        
+        self.logger.info(f"Using optimized scanning with {len(known_agencies)} agencies")
+        
+        # Test each known agency to see if it exists
+        with tqdm(known_agencies, desc="Testing agencies", unit="agency") as pbar:
+            for agency in pbar:
+                pbar.set_description(f"Testing {agency}")
+                agency_path = self.join_paths(raw_data_path, agency)
+                
+                # Quick check if agency directory exists
+                if self.path_exists(agency_path):
+                    self.logger.debug(f"Found agency: {agency}")
+                    
+                    # For agencies that exist, we can either:
+                    # 1. List all dockets (if the agency is small)
+                    # 2. Use a pattern-based approach for large agencies
+                    
+                    # For now, let's try listing dockets for agencies that exist
+                    try:
+                        docket_dirs = self.list_directory(agency_path)
+                        self.logger.debug(f"  Found {len(docket_dirs)} dockets in {agency}")
+                        
+                        for docket_dir in docket_dirs:
+                            docket_path = self.join_paths(agency_path, docket_dir)
+                            if self.is_directory(docket_path):
+                                # Apply filters
+                                if self._should_process_docket(docket_path):
+                                    dockets.append(docket_path)
+                                    self.logger.debug(f"    Docket: {docket_dir}")
+                                else:
+                                    self.logger.debug(f"    Skipping docket: {docket_dir} (filtered out)")
+                    except Exception as e:
+                        self.logger.warning(f"Error listing dockets for agency {agency}: {e}")
+                        # Continue with other agencies
+                        continue
+        
+        return dockets
+    
+    def add_filters(self, agency: str = None, docket_pattern: str = None):
+        """Add filters to process only specific agencies or dockets"""
+        if agency:
+            self.agency_filter = agency.upper()
+            self.logger.info(f"Added agency filter: {self.agency_filter}")
+        
+        if docket_pattern:
+            self.docket_pattern_filter = docket_pattern
+            self.logger.info(f"Added docket pattern filter: {self.docket_pattern}")
+    
+    def _should_process_docket(self, docket_path: str) -> bool:
+        """Check if a docket should be processed based on filters"""
+        docket_name = PathHandler.get_name(docket_path)
+        
+        # Check agency filter
+        if self.agency_filter:
+            # Extract agency from docket name (e.g., "CMS-2025-0020" -> "CMS")
+            if '/' in docket_name:
+                agency = docket_name.split('/')[0]
+            elif '-' in docket_name:
+                agency = docket_name.split('-')[0]
+            else:
+                agency = "UNKNOWN"
+            
+            if agency != self.agency_filter:
+                return False
+        
+        # Check docket pattern filter
+        if self.docket_pattern_filter:
+            import fnmatch
+            if not fnmatch.fnmatch(docket_name, self.docket_pattern_filter):
+                return False
+        
+        return True
     
     def check_permissions(self):
         """Check read/write permissions before starting conversion"""
@@ -799,6 +919,8 @@ class IcebergConverter:
     
     def convert_all(self):
         """Convert all dockets to Iceberg format"""
+        print("🚀 Initializing Mirrulations to Iceberg conversion...")
+        
         if self.verbose:
             self.logger.info(f"Starting conversion from: {self.data_path}")
             self.logger.info(f"Output path: {self.output_path}")
@@ -807,14 +929,17 @@ class IcebergConverter:
             if self.is_s3_target:
                 self.logger.info(f"Target: S3 bucket: {self.output_path}")
         
+        print("🔍 Checking permissions and connectivity...")
         # Check permissions before starting
         try:
             self.check_permissions()
+            print("✅ Permissions check passed")
         except (PermissionError, OSError) as e:
             self.logger.error(f"Permission check failed: {e}")
             self.logger.error("Please ensure you have read access to the data directory and write access to the output directory.")
-            return
+            return False
         
+        print("📁 Scanning for docket directories...")
         # Get all docket directories
         docket_dirs = self.get_docket_directories()
         total_dockets = len(docket_dirs)
@@ -824,7 +949,10 @@ class IcebergConverter:
         
         if total_dockets == 0:
             self.logger.error("No dockets found. Check the data path structure.")
-            return
+            return False
+        
+        print(f"🎯 Found {total_dockets} dockets to process")
+        print("🔄 Starting conversion process...")
         
         start_time = time.time()
         
@@ -857,20 +985,20 @@ class IcebergConverter:
         
         # Final statistics
         total_time = time.time() - start_time
-        print(f"\nConversion complete!")
-        print(f"Total time: {total_time/3600:.2f} hours")
-        print(f"Dockets processed: {self.stats['dockets_processed']}")
-        print(f"Dockets skipped: {self.stats['dockets_skipped']}")
-        print(f"Errors: {self.stats['errors']}")
+        print(f"\n🎉 Conversion complete!")
+        print(f"⏱️  Total time: {total_time/3600:.2f} hours")
+        print(f"📁 Dockets processed: {self.stats['dockets_processed']}")
+        print(f"⏭️  Dockets skipped: {self.stats['dockets_skipped']}")
+        print(f"❌ Errors: {self.stats['errors']}")
         if self.stats['dockets_processed'] > 0:
-            print(f"Average rate: {self.stats['dockets_processed']/total_time:.2f} dockets/sec")
+            print(f"🚀 Average rate: {self.stats['dockets_processed']/total_time:.2f} dockets/sec")
         
         # Check if we had permission errors
         if self.stats['errors'] > 0:
             self.logger.error("Conversion completed with errors. Check the log for details.")
             return False
         else:
-            print("Conversion completed successfully!")
+            print("✅ Conversion completed successfully!")
             return True
 
 
@@ -879,6 +1007,8 @@ def main():
     parser = argparse.ArgumentParser(description="Convert Mirrulations data to Iceberg format")
     parser.add_argument("data_path", help="Path to Mirrulations data directory or S3 bucket path")
     parser.add_argument("--output-path", help="Output directory for Iceberg data or S3 bucket path")
+    parser.add_argument("--agency", help="Process only a specific agency (e.g., 'CMS', 'DEA')")
+    parser.add_argument("--docket-pattern", help="Process only dockets matching a pattern (e.g., 'CMS-2025-*')")
     parser.add_argument("--compression", default="snappy", 
                        choices=["snappy", "gzip", "brotli", "lz4"],
                        help="Compression algorithm for Parquet files")
@@ -904,6 +1034,10 @@ def main():
         verbose=args.verbose,
         comment_threshold=args.comment_threshold
     )
+    
+    # Apply filters if specified
+    if args.agency or args.docket_pattern:
+        converter.add_filters(agency=args.agency, docket_pattern=args.docket_pattern)
     
     # Run conversion
     try:
