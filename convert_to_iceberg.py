@@ -289,8 +289,19 @@ class IcebergConverter:
                     item_name = PathHandler.get_name(item)
                     self.logger.debug(f"  Checking item: {item_name} against pattern: {regex_pattern}")
                     if re.match(regex_pattern, item_name):
-                        files.append(item)
-                        self.logger.debug(f"    ✓ Matched: {item}")
+                        # Ensure S3 paths have the proper s3:// prefix
+                        if not item.startswith('s3://'):
+                            # Extract bucket from the directory path
+                            if PathHandler.is_s3_path(directory):
+                                bucket, _ = PathHandler.parse_s3_path(directory)
+                                s3_path = f"s3://{item}"
+                            else:
+                                # For non-S3 directories, assume the item is already a full S3 path
+                                s3_path = item
+                        else:
+                            s3_path = item
+                        files.append(s3_path)
+                        self.logger.debug(f"    ✓ Matched: {s3_path}")
                     else:
                         self.logger.debug(f"    ✗ No match: {item}")
                 
@@ -475,7 +486,7 @@ class IcebergConverter:
                         result['documents'].append(flattened_doc)
                         self.logger.debug(f"    Successfully processed document: {PathHandler.get_name(doc_file)}")
                     else:
-                        self.logger.warning(f"    Failed to load document: {doc_file}")
+                        self.logger.debug(f"    Failed to load document: {doc_file}")
             
             # NEW: Try the text-* subdirectory structure for documents
             if not result['documents']:
@@ -496,7 +507,7 @@ class IcebergConverter:
                                 result['documents'].append(flattened_doc)
                                 self.logger.debug(f"    Successfully processed document: {PathHandler.get_name(doc_file)}")
                             else:
-                                self.logger.warning(f"    Failed to load document: {doc_file}")
+                                self.logger.debug(f"    Failed to load document: {doc_file}")
             
             # Process comments
             comments_dir = self.join_paths(raw_data_path, "comments")
