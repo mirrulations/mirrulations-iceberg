@@ -242,6 +242,11 @@ class IcebergConverter:
                 if not self.s3_fs:
                     raise RuntimeError("S3 filesystem not initialized")
                 
+                # For S3, first check if file exists to avoid false warnings
+                if not self.s3_fs.exists(file_path):
+                    self.logger.debug(f"S3 file does not exist: {file_path}")
+                    return None
+                
                 self.logger.debug(f"Reading S3 file: {file_path}")
                 with self.s3_fs.open(file_path, 'r', encoding='utf-8') as f:
                     content = f.read()
@@ -254,7 +259,9 @@ class IcebergConverter:
             self.logger.error(f"Permission denied reading {file_path}: {e}")
             raise
         except FileNotFoundError as e:
-            self.logger.warning(f"File not found: {file_path}")
+            # Only log as warning if we didn't already check existence
+            if not PathHandler.is_s3_path(file_path):
+                self.logger.warning(f"File not found: {file_path}")
             return None
         except json.JSONDecodeError as e:
             self.logger.error(f"JSON decode error reading {file_path}: {e}")
