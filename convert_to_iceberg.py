@@ -242,8 +242,11 @@ class IcebergConverter:
                 if not self.s3_fs:
                     raise RuntimeError("S3 filesystem not initialized")
                 
+                self.logger.debug(f"Reading S3 file: {file_path}")
                 with self.s3_fs.open(file_path, 'r', encoding='utf-8') as f:
-                    return json.load(f)
+                    content = f.read()
+                    self.logger.debug(f"Read {len(content)} characters from {file_path}")
+                    return json.loads(content)
             else:
                 with open(file_path, 'r', encoding='utf-8') as f:
                     return json.load(f)
@@ -253,8 +256,11 @@ class IcebergConverter:
         except FileNotFoundError as e:
             self.logger.warning(f"File not found: {file_path}")
             return None
+        except json.JSONDecodeError as e:
+            self.logger.error(f"JSON decode error reading {file_path}: {e}")
+            return None
         except Exception as e:
-            self.logger.warning(f"Failed to load {file_path}: {e}")
+            self.logger.error(f"Failed to load {file_path}: {e}")
             return None
     
     def glob_files(self, directory: str, pattern: str) -> List[str]:
@@ -268,11 +274,20 @@ class IcebergConverter:
                 regex_pattern = pattern.replace('*', '.*')
                 files = []
                 
-                for item in self.s3_fs.ls(directory):
+                self.logger.debug(f"Globbing S3 directory: {directory} with pattern: {pattern}")
+                directory_contents = self.s3_fs.ls(directory)
+                self.logger.debug(f"Found {len(directory_contents)} items in {directory}")
+                
+                for item in directory_contents:
                     item_name = PathHandler.get_name(item)
+                    self.logger.debug(f"  Checking item: {item_name} against pattern: {regex_pattern}")
                     if re.match(regex_pattern, item_name):
                         files.append(item)
+                        self.logger.debug(f"    ✓ Matched: {item}")
+                    else:
+                        self.logger.debug(f"    ✗ No match: {item}")
                 
+                self.logger.debug(f"Glob result: {len(files)} files matched pattern")
                 return files
             except Exception as e:
                 self.logger.error(f"Failed to glob S3 files {directory}/{pattern}: {e}")
@@ -442,11 +457,18 @@ class IcebergConverter:
             # Process documents
             documents_dir = self.join_paths(raw_data_path, "documents")
             if self.path_exists(documents_dir):
-                for doc_file in self.glob_files(documents_dir, "*.json"):
+                self.logger.debug(f"  Found documents directory: {documents_dir}")
+                doc_files = self.glob_files(documents_dir, "*.json")
+                self.logger.debug(f"  Found {len(doc_files)} document files")
+                for doc_file in doc_files:
+                    self.logger.debug(f"    Processing document: {doc_file}")
                     doc_data = self.load_json_file(doc_file)
                     if doc_data:
                         flattened_doc = self.flatten_document_data(doc_data)
                         result['documents'].append(flattened_doc)
+                        self.logger.debug(f"    Successfully processed document: {PathHandler.get_name(doc_file)}")
+                    else:
+                        self.logger.warning(f"    Failed to load document: {doc_file}")
             
             # NEW: Try the text-* subdirectory structure for documents
             if not result['documents']:
@@ -457,11 +479,17 @@ class IcebergConverter:
                     documents_dir = self.join_paths(raw_data_path, text_subdir, "documents")
                     if self.path_exists(documents_dir):
                         self.logger.debug(f"  Found documents directory: {documents_dir}")
-                        for doc_file in self.glob_files(documents_dir, "*.json"):
+                        doc_files = self.glob_files(documents_dir, "*.json")
+                        self.logger.debug(f"  Found {len(doc_files)} document files in {text_subdir}")
+                        for doc_file in doc_files:
+                            self.logger.debug(f"    Processing document: {doc_file}")
                             doc_data = self.load_json_file(doc_file)
                             if doc_data:
                                 flattened_doc = self.flatten_document_data(doc_data)
                                 result['documents'].append(flattened_doc)
+                                self.logger.debug(f"    Successfully processed document: {PathHandler.get_name(doc_file)}")
+                            else:
+                                self.logger.warning(f"    Failed to load document: {doc_file}")
             
             # Process comments
             comments_dir = self.join_paths(raw_data_path, "comments")
@@ -602,8 +630,24 @@ class IcebergConverter:
                                     result['comments'].append(flattened_comment)
         
         # Debug: Log what data was found
-        self.logger.debug(f"  Found: docket_info={result['docket_info'] is not None}, "
+        self.logger.info(f"  Found: docket_info={result['docket_info'] is not None}, "
                          f"documents={len(result['documents'])}, comments={len(result['comments'])}")
+        
+        # If we found no data, log the paths we checked
+        if not result['docket_info'] and not result['documents'] and not result['comments']:
+            self.logger.warning(f"  No data found for docket {docket_id}. Checked paths:")
+            # Log the paths we checked for debugging
+            raw_data_path = self.join_paths(docket_path, "raw-data")
+            if self.path_exists(raw_data_path):
+                self.logger.warning(f"    Raw data path exists: {raw_data_path}")
+                # List what's in the raw-data directory
+                try:
+                    raw_contents = self.list_directory(raw_data_path)
+                    self.logger.warning(f"    Raw data contents: {raw_contents[:10]}...")
+                except Exception as e:
+                    self.logger.warning(f"    Error listing raw data contents: {e}")
+            else:
+                self.logger.warning(f"    Raw data path does not exist: {raw_data_path}")
         
         return result
     
@@ -843,7 +887,7 @@ class IcebergConverter:
         
         if docket_pattern:
             self.docket_pattern_filter = docket_pattern
-            self.logger.info(f"Added docket pattern filter: {self.docket_pattern}")
+            self.logger.info(f"Added docket pattern filter: {self.docket_pattern_filter}")
     
     def _should_process_docket(self, docket_path: str) -> bool:
         """Check if a docket should be processed based on filters"""
