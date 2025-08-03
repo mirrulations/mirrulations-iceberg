@@ -901,6 +901,142 @@ class IcebergConverter:
         
         return dockets
     
+    def _convert_s3_dockets_streaming(self) -> bool:
+        """Convert S3 dockets using streaming approach - process as we find them"""
+        raw_data_path = self.join_paths(self.data_path, "raw-data")
+        
+        # Known agency prefixes from Mirrulations structure
+        known_agencies = [
+            'ABMC', 'ACF', 'ACFR', 'ACHP', 'ACL', 'ACUS', 'ADF', 'AFRH', 'AHRQ', 'AID',
+            'AMS', 'APHIS', 'ATF', 'BIA', 'BLM', 'BLS', 'BOP', 'BSEE', 'BTS', 'CBP',
+            'CDC', 'CFPB', 'CMS', 'CNCS', 'CPSC', 'CRS', 'DARS', 'DEA', 'DHS', 'DOC',
+            'DOD', 'DOE', 'DOI', 'DOJ', 'DOL', 'DOS', 'DOT', 'ED', 'EPA', 'FAA',
+            'FBI', 'FCC', 'FDA', 'FDIC', 'FHFA', 'FISC', 'FLRA', 'FMCSA', 'FRA', 'FRB',
+            'FTC', 'GAO', 'GSA', 'HHS', 'HUD', 'ICE', 'IRS', 'ITC', 'NASA', 'NEA',
+            'NFA', 'NGA', 'NIGC', 'NIH', 'NIST', 'NOAA', 'NPS', 'NRC', 'NSA', 'NSF',
+            'NTSB', 'OCC', 'ODNI', 'OGE', 'OMB', 'ONRR', 'OPM', 'OSHA', 'PBGC', 'PTO',
+            'SEC', 'SBA', 'SSA', 'SSS', 'TREAS', 'TSA', 'USCIS', 'USDA', 'USGS', 'VA'
+        ]
+        
+        # Apply agency filter if specified
+        if self.agency_filter:
+            if self.agency_filter in known_agencies:
+                known_agencies = [self.agency_filter]
+                self.logger.info(f"Filtering to single agency: {self.agency_filter}")
+            else:
+                self.logger.warning(f"Agency filter '{self.agency_filter}' not in known agencies list")
+                # If agency filter is not in known list, just try it anyway
+                known_agencies = [self.agency_filter]
+        
+        self.logger.info(f"Starting streaming conversion with {len(known_agencies)} agencies")
+        
+        # Process each agency
+        for agency in known_agencies:
+            agency_path = self.join_paths(raw_data_path, agency)
+            
+            # Quick check if agency directory exists
+            if not self.path_exists(agency_path):
+                continue
+                
+            self.logger.info(f"Processing agency: {agency}")
+            
+            # If we have a specific docket pattern, check just that docket
+            if self.docket_pattern_filter:
+                docket_id = self.docket_pattern_filter
+                docket_path = self.join_paths(agency_path, docket_id)
+                
+                if self.path_exists(docket_path) and self.is_directory(docket_path):
+                    if self._should_process_docket(docket_path):
+                        self._process_single_docket(docket_path)
+                    else:
+                        self.logger.info(f"Skipping docket {docket_id} (filtered out)")
+                else:
+                    self.logger.info(f"Docket {docket_id} not found in {agency}")
+            else:
+                # Stream through all dockets in the agency
+                try:
+                    docket_dirs = self.list_directory(agency_path)
+                    self.logger.info(f"Found {len(docket_dirs)} dockets in {agency}")
+                    
+                    for docket_dir in docket_dirs:
+                        docket_path = self.join_paths(agency_path, docket_dir)
+                        if self.is_directory(docket_path):
+                            if self._should_process_docket(docket_path):
+                                self._process_single_docket(docket_path)
+                            else:
+                                self.logger.debug(f"Skipping docket: {docket_dir} (filtered out)")
+                except Exception as e:
+                    self.logger.warning(f"Error listing dockets for agency {agency}: {e}")
+                    continue
+        
+        return True
+    
+    def _convert_local_dockets_streaming(self) -> bool:
+        """Convert local dockets using streaming approach"""
+        raw_data_path = self.join_paths(self.data_path, "raw-data")
+        
+        if not self.path_exists(raw_data_path):
+            self.logger.error(f"Raw data path does not exist: {raw_data_path}")
+            return False
+        
+        # Get agency directories
+        agency_dirs = self.list_directory(raw_data_path)
+        
+        for agency_dir in agency_dirs:
+            agency_path = self.join_paths(raw_data_path, agency_dir)
+            
+            if not self.is_directory(agency_path):
+                continue
+                
+            # Apply agency filter if specified
+            if self.agency_filter and agency_dir != self.agency_filter:
+                continue
+                
+            self.logger.info(f"Processing agency: {agency_dir}")
+            
+            # Get docket directories
+            try:
+                docket_dirs = self.list_directory(agency_path)
+                
+                for docket_dir in docket_dirs:
+                    docket_path = self.join_paths(agency_path, docket_dir)
+                    if self.is_directory(docket_path):
+                        if self._should_process_docket(docket_path):
+                            self._process_single_docket(docket_path)
+                        else:
+                            self.logger.debug(f"Skipping docket: {docket_dir} (filtered out)")
+            except Exception as e:
+                self.logger.warning(f"Error listing dockets for agency {agency_dir}: {e}")
+                continue
+        
+        return True
+    
+    def _process_single_docket(self, docket_path: str):
+        """Process a single docket"""
+        try:
+            docket_name = PathHandler.get_name(docket_path)
+            print(f"🔄 Converting {docket_name}...")
+            
+            # Process docket
+            docket_data = self.process_docket(docket_path)
+            
+            # Save dataset
+            if self.save_docket_dataset(docket_data):
+                self.stats['dockets_processed'] += 1
+                print(f"✅ Completed {docket_name}")
+            else:
+                self.stats['dockets_skipped'] += 1
+                print(f"⏭️  Skipped {docket_name}")
+                
+        except (PermissionError, OSError) as e:
+            self.logger.error(f"Permission error processing {docket_path}: {e}")
+            self.logger.error("Stopping conversion due to permission issues.")
+            self.stats['errors'] += 1
+            raise
+        except Exception as e:
+            self.logger.error(f"Error processing {docket_path}: {e}")
+            self.stats['errors'] += 1
+    
     def add_filters(self, agency: str = None, docket_pattern: str = None):
         """Add filters to process only specific agencies or dockets"""
         if agency:
@@ -1005,49 +1141,14 @@ class IcebergConverter:
             self.logger.error("Please ensure you have read access to the data directory and write access to the output directory.")
             return False
         
-        print("📁 Scanning for docket directories...")
-        # Get all docket directories
-        docket_dirs = self.get_docket_directories()
-        total_dockets = len(docket_dirs)
-        
-        if self.verbose:
-            self.logger.info(f"Found {total_dockets} dockets to process")
-        
-        if total_dockets == 0:
-            self.logger.error("No dockets found. Check the data path structure.")
-            return False
-        
-        print(f"🎯 Found {total_dockets} dockets to process")
         print("🔄 Starting conversion process...")
-        
         start_time = time.time()
         
-        # Process each docket with tqdm progress bar
-        with tqdm(docket_dirs, desc="Converting dockets", unit="docket", position=0) as pbar:
-            for docket_dir in pbar:
-                try:
-                    # Update progress bar description with current docket
-                    docket_name = PathHandler.get_name(docket_dir)
-                    pbar.set_description(f"Converting {docket_name}")
-                    
-                    # Process docket
-                    docket_data = self.process_docket(docket_dir, outer_pbar=pbar)
-                    
-                    # Save dataset
-                    if self.save_docket_dataset(docket_data):
-                        self.stats['dockets_processed'] += 1
-                    else:
-                        self.stats['dockets_skipped'] += 1
-                    
-                except (PermissionError, OSError) as e:
-                    self.logger.error(f"Permission error processing {docket_dir}: {e}")
-                    self.logger.error("Stopping conversion due to permission issues.")
-                    self.stats['errors'] += 1
-                    break
-                except Exception as e:
-                    self.logger.error(f"Error processing {docket_dir}: {e}")
-                    self.stats['errors'] += 1
-                    continue
+        # Process dockets as we find them (no upfront scanning)
+        if self.is_s3_source:
+            success = self._convert_s3_dockets_streaming()
+        else:
+            success = self._convert_local_dockets_streaming()
         
         # Final statistics
         total_time = time.time() - start_time
