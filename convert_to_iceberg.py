@@ -166,10 +166,18 @@ class IcebergConverter:
                 # List contents
                 contents = []
                 for item in self.s3_fs.ls(path):
+                    # For S3, the items returned are full paths, so we need to extract the relative part
                     # Remove the path prefix to get relative names
-                    relative_name = item.replace(path, '').rstrip('/')
-                    if relative_name and '/' not in relative_name:  # Only immediate children
-                        contents.append(relative_name)
+                    if item.startswith(path):
+                        relative_name = item[len(path):].rstrip('/')
+                        if relative_name and '/' not in relative_name:  # Only immediate children
+                            contents.append(relative_name)
+                    else:
+                        # If the item doesn't start with our path, it might be a different format
+                        # Try to extract just the filename
+                        item_name = PathHandler.get_name(item)
+                        if item_name and item_name not in contents:
+                            contents.append(item_name)
                 
                 return contents
             except Exception as e:
@@ -700,22 +708,31 @@ class IcebergConverter:
         
         # Look for raw-data structure (Mirrulations format)
         raw_data_path = self.join_paths(self.data_path, "raw-data")
+        self.logger.info(f"Checking for raw-data structure at: {raw_data_path}")
         if self.path_exists(raw_data_path):
-            self.logger.debug(f"Found raw-data structure at {raw_data_path}")
-            for agency_dir in self.list_directory(raw_data_path):
+            self.logger.info(f"Found raw-data structure at {raw_data_path}")
+            agency_dirs = self.list_directory(raw_data_path)
+            self.logger.info(f"Found {len(agency_dirs)} agency directories: {agency_dirs[:5]}...")
+            
+            for agency_dir in agency_dirs:
                 agency_path = self.join_paths(raw_data_path, agency_dir)
                 if self.is_directory(agency_path):
                     self.logger.debug(f"  Agency: {agency_dir}")
-                    for docket_dir in self.list_directory(agency_path):
+                    docket_dirs = self.list_directory(agency_path)
+                    self.logger.debug(f"    Found {len(docket_dirs)} dockets in {agency_dir}")
+                    for docket_dir in docket_dirs:
                         docket_path = self.join_paths(agency_path, docket_dir)
                         if self.is_directory(docket_path):
                             dockets.append(docket_path)
-                            self.logger.debug(f"    Docket: {docket_dir}")
-        
-        # Look for direct docket structure (like in results/)
+                            self.logger.debug(f"      Docket: {docket_dir}")
         else:
-            self.logger.debug(f"No raw-data structure, looking for direct docket structure")
-            for docket_dir in self.list_directory(self.data_path):
+            self.logger.info(f"No raw-data structure found at {raw_data_path}")
+            # Look for direct docket structure (like in results/)
+            self.logger.info(f"Looking for direct docket structure in {self.data_path}")
+            data_contents = self.list_directory(self.data_path)
+            self.logger.info(f"Found {len(data_contents)} items in data path: {data_contents[:5]}...")
+            
+            for docket_dir in data_contents:
                 docket_path = self.join_paths(self.data_path, docket_dir)
                 if self.is_directory(docket_path) and not PathHandler.get_name(docket_path).startswith('.'):
                     # Check if this looks like a docket directory
@@ -730,7 +747,7 @@ class IcebergConverter:
             if PathHandler.get_name(docket) not in ['derived-data', 'raw-data']:
                 filtered_dockets.append(docket)
         
-        self.logger.info(f"Found {len(filtered_dockets)} docket directories")
+        self.logger.info(f"Found {len(filtered_dockets)} docket directories after filtering")
         return sorted(filtered_dockets)
     
     def check_permissions(self):
