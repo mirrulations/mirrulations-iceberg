@@ -145,7 +145,6 @@ class IcebergConverter:
         
         # Filters for processing specific agencies or dockets
         self.agency_filter = None
-        self.docket_pattern_filter = None
     
     def setup_s3(self):
         """Setup S3 filesystem"""
@@ -398,7 +397,7 @@ class IcebergConverter:
         
         return flattened
     
-    def process_docket(self, docket_path: str, outer_pbar=None) -> Dict[str, Any]:
+    def process_docket(self, docket_path: str, file_pbar=None) -> Dict[str, Any]:
         """Process a single docket directory"""
         docket_id = PathHandler.get_name(docket_path)
         
@@ -513,9 +512,9 @@ class IcebergConverter:
             comments_dir = self.join_paths(raw_data_path, "comments")
             if self.path_exists(comments_dir):
                 comment_files = self.glob_files(comments_dir, "*.json")
-                if len(comment_files) > self.comment_threshold and outer_pbar:  # Only show nested bar for dockets with many comments
+                if len(comment_files) > self.comment_threshold and file_pbar:  # Only show nested bar for dockets with many comments
                     with tqdm(comment_files, desc=f"  Processing {len(comment_files)} comments", 
-                             leave=False, position=1) as comment_pbar:
+                             leave=False, position=2) as comment_pbar:
                         for comment_file in comment_pbar:
                             comment_data = self.load_json_file(comment_file)
                             if comment_data:
@@ -538,9 +537,9 @@ class IcebergConverter:
                     if self.path_exists(comments_dir):
                         self.logger.debug(f"  Found comments directory: {comments_dir}")
                         comment_files = self.glob_files(comments_dir, "*.json")
-                        if len(comment_files) > self.comment_threshold and outer_pbar:  # Only show nested bar for dockets with many comments
+                        if len(comment_files) > self.comment_threshold and file_pbar:  # Only show nested bar for dockets with many comments
                             with tqdm(comment_files, desc=f"  Processing {len(comment_files)} comments", 
-                                     leave=False, position=1) as comment_pbar:
+                                     leave=False, position=2) as comment_pbar:
                                 for comment_file in comment_pbar:
                                     comment_data = self.load_json_file(comment_file)
                                     if comment_data:
@@ -610,9 +609,9 @@ class IcebergConverter:
             comments_dir = self.join_paths(docket_path, "comments")
             if self.path_exists(comments_dir):
                 comment_files = self.glob_files(comments_dir, "*.json")
-                if len(comment_files) > self.comment_threshold and outer_pbar:  # Only show nested bar for dockets with many comments
+                if len(comment_files) > self.comment_threshold and file_pbar:  # Only show nested bar for dockets with many comments
                     with tqdm(comment_files, desc=f"  Processing {len(comment_files)} comments", 
-                             leave=False, position=1) as comment_pbar:
+                             leave=False, position=2) as comment_pbar:
                         for comment_file in comment_pbar:
                             comment_data = self.load_json_file(comment_file)
                             if comment_data:
@@ -632,9 +631,9 @@ class IcebergConverter:
                     comments_dir = self.join_paths(docket_path, text_subdir, "comments")
                     if self.path_exists(comments_dir):
                         comment_files = self.glob_files(comments_dir, "*.json")
-                        if len(comment_files) > self.comment_threshold and outer_pbar:  # Only show nested bar for dockets with many comments
+                        if len(comment_files) > self.comment_threshold and file_pbar:  # Only show nested bar for dockets with many comments
                             with tqdm(comment_files, desc=f"  Processing {len(comment_files)} comments", 
-                                     leave=False, position=1) as comment_pbar:
+                                     leave=False, position=2) as comment_pbar:
                                 for comment_file in comment_pbar:
                                     comment_data = self.load_json_file(comment_file)
                                     if comment_data:
@@ -919,115 +918,207 @@ class IcebergConverter:
         
         return dockets
     
+    def _get_agency_count(self, raw_data_path: str) -> int:
+        """Get the count of agencies using ListObjectsV2 with delimiter"""
+        try:
+            import boto3
+            s3_client = boto3.client('s3')
+            
+            # Extract bucket and prefix from raw_data_path
+            if raw_data_path.startswith('s3://'):
+                bucket = raw_data_path.split('/')[2]
+                prefix = '/'.join(raw_data_path.split('/')[3:]) + '/'
+            else:
+                bucket = raw_data_path.split('/')[0]
+                prefix = '/'.join(raw_data_path.split('/')[1:]) + '/'
+            
+            response = s3_client.list_objects_v2(
+                Bucket=bucket,
+                Prefix=prefix,
+                Delimiter='/',
+                MaxKeys=1000
+            )
+            
+            return len(response.get('CommonPrefixes', []))
+        except Exception as e:
+            self.logger.warning(f"Could not get agency count: {e}")
+            return 0
+    
+    def _get_docket_count(self, agency_path: str) -> int:
+        """Get the count of dockets in an agency"""
+        try:
+            docket_dirs = self.list_directory(agency_path)
+            return len([d for d in docket_dirs if self.is_directory(self.join_paths(agency_path, d))])
+        except Exception as e:
+            self.logger.warning(f"Could not get docket count for {agency_path}: {e}")
+            return 0
+    
     def _convert_s3_dockets_streaming(self) -> bool:
-        """Convert S3 dockets using streaming approach - process as we find them"""
+        """Convert S3 dockets using streaming approach with three-level progress bars"""
         raw_data_path = self.join_paths(self.data_path, "raw-data")
         
-        # Known agency prefixes from Mirrulations structure
-        known_agencies = [
-            'ABMC', 'ACF', 'ACFR', 'ACHP', 'ACL', 'ACUS', 'ADF', 'AFRH', 'AHRQ', 'AID',
-            'AMS', 'APHIS', 'ATF', 'BIA', 'BLM', 'BLS', 'BOP', 'BSEE', 'BTS', 'CBP',
-            'CDC', 'CFPB', 'CMS', 'CNCS', 'CPSC', 'CRS', 'DARS', 'DEA', 'DHS', 'DOC',
-            'DOD', 'DOE', 'DOI', 'DOJ', 'DOL', 'DOS', 'DOT', 'ED', 'EPA', 'FAA',
-            'FBI', 'FCC', 'FDA', 'FDIC', 'FHFA', 'FISC', 'FLRA', 'FMCSA', 'FRA', 'FRB',
-            'FTC', 'GAO', 'GSA', 'HHS', 'HUD', 'ICE', 'IRS', 'ITC', 'NASA', 'NEA',
-            'NFA', 'NGA', 'NIGC', 'NIH', 'NIST', 'NOAA', 'NPS', 'NRC', 'NSA', 'NSF',
-            'NTSB', 'OCC', 'ODNI', 'OGE', 'OMB', 'ONRR', 'OPM', 'OSHA', 'PBGC', 'PTO',
-            'SEC', 'SBA', 'SSA', 'SSS', 'TREAS', 'TSA', 'USCIS', 'USDA', 'USGS', 'VA'
-        ]
-        
-        # Apply agency filter if specified
+        # Get list of agencies to process
         if self.agency_filter:
-            if self.agency_filter in known_agencies:
-                known_agencies = [self.agency_filter]
-                self.logger.info(f"Filtering to single agency: {self.agency_filter}")
-            else:
-                self.logger.warning(f"Agency filter '{self.agency_filter}' not in known agencies list")
-                # If agency filter is not in known list, just try it anyway
-                known_agencies = [self.agency_filter]
-        
-        self.logger.info(f"Starting streaming conversion with {len(known_agencies)} agencies")
-        
-        # Process each agency
-        for agency in known_agencies:
-            agency_path = self.join_paths(raw_data_path, agency)
-            
-            # Quick check if agency directory exists
-            if not self.path_exists(agency_path):
-                continue
+            agencies = [self.agency_filter]
+            self.logger.info(f"Processing single agency: {self.agency_filter}")
+        else:
+            # Get all agencies using ListObjectsV2
+            try:
+                import boto3
+                s3_client = boto3.client('s3')
                 
-            self.logger.info(f"Processing agency: {agency}")
-            
-            # If we have a specific docket pattern, check just that docket
-            if self.docket_pattern_filter:
-                docket_id = self.docket_pattern_filter
-                docket_path = self.join_paths(agency_path, docket_id)
+                bucket = self.data_path.split('/')[2]  # Extract bucket name
+                response = s3_client.list_objects_v2(
+                    Bucket=bucket,
+                    Prefix='raw-data/',
+                    Delimiter='/',
+                    MaxKeys=1000
+                )
                 
-                if self.path_exists(docket_path) and self.is_directory(docket_path):
-                    if self._should_process_docket(docket_path):
-                        self._process_single_docket(docket_path)
-                    else:
-                        self.logger.info(f"Skipping docket {docket_id} (filtered out)")
-                else:
-                    self.logger.info(f"Docket {docket_id} not found in {agency}")
+                agencies = []
+                for prefix in response.get('CommonPrefixes', []):
+                    agency_name = prefix['Prefix'].split('/')[-2]  # Extract agency name
+                    agencies.append(agency_name)
+                
+                self.logger.info(f"Found {len(agencies)} agencies to process")
+            except Exception as e:
+                self.logger.error(f"Failed to get agency list: {e}")
+                return False
+        
+        # Setup progress bars
+        agency_pbar = None
+        docket_pbar = None
+        file_pbar = None
+        
+        try:
+            # Agency-level progress bar (only if processing multiple agencies)
+            if len(agencies) > 1:
+                agency_pbar = tqdm(agencies, desc="Processing agencies", unit="agency", position=0)
             else:
-                # Stream through all dockets in the agency
+                agency_pbar = agencies  # Just iterate directly
+            
+            # Process each agency
+            for agency in agency_pbar:
+                agency_path = self.join_paths(raw_data_path, agency)
+                
+                # Quick check if agency directory exists
+                if not self.path_exists(agency_path):
+                    continue
+                
+                if len(agencies) > 1:
+                    agency_pbar.set_description(f"Processing {agency}")
+                
+                # Get docket count for this agency
+                docket_count = self._get_docket_count(agency_path)
+                if docket_count == 0:
+                    continue
+                
+                # Get list of dockets
                 try:
                     docket_dirs = self.list_directory(agency_path)
-                    self.logger.info(f"Found {len(docket_dirs)} dockets in {agency}")
-                    
-                    for docket_dir in docket_dirs:
-                        docket_path = self.join_paths(agency_path, docket_dir)
-                        if self.is_directory(docket_path):
-                            if self._should_process_docket(docket_path):
-                                self._process_single_docket(docket_path)
-                            else:
-                                self.logger.debug(f"Skipping docket: {docket_dir} (filtered out)")
+                    dockets = [d for d in docket_dirs if self.is_directory(self.join_paths(agency_path, d))]
                 except Exception as e:
                     self.logger.warning(f"Error listing dockets for agency {agency}: {e}")
                     continue
-        
-        return True
+                
+                # Docket-level progress bar
+                docket_pbar = tqdm(dockets, desc=f"Processing {agency} dockets", unit="docket", position=1, leave=False)
+                
+                for docket_dir in docket_pbar:
+                    docket_path = self.join_paths(agency_path, docket_dir)
+                    docket_pbar.set_description(f"Processing {docket_dir}")
+                    
+                    # Process the docket
+                    self._process_single_docket_with_progress(docket_path, file_pbar)
+                
+                docket_pbar.close()
+            
+            return True
+            
+        finally:
+            # Clean up progress bars
+            if agency_pbar and hasattr(agency_pbar, 'close'):
+                agency_pbar.close()
+            if docket_pbar and hasattr(docket_pbar, 'close'):
+                docket_pbar.close()
+            if file_pbar and hasattr(file_pbar, 'close'):
+                file_pbar.close()
     
     def _convert_local_dockets_streaming(self) -> bool:
-        """Convert local dockets using streaming approach"""
+        """Convert local dockets using streaming approach with three-level progress bars"""
         raw_data_path = self.join_paths(self.data_path, "raw-data")
         
         if not self.path_exists(raw_data_path):
             self.logger.error(f"Raw data path does not exist: {raw_data_path}")
             return False
         
-        # Get agency directories
-        agency_dirs = self.list_directory(raw_data_path)
-        
-        for agency_dir in agency_dirs:
-            agency_path = self.join_paths(raw_data_path, agency_dir)
-            
-            if not self.is_directory(agency_path):
-                continue
-                
-            # Apply agency filter if specified
-            if self.agency_filter and agency_dir != self.agency_filter:
-                continue
-                
-            self.logger.info(f"Processing agency: {agency_dir}")
-            
-            # Get docket directories
+        # Get list of agencies to process
+        if self.agency_filter:
+            agencies = [self.agency_filter]
+            self.logger.info(f"Processing single agency: {self.agency_filter}")
+        else:
+            # Get all agencies from local directory
             try:
-                docket_dirs = self.list_directory(agency_path)
-                
-                for docket_dir in docket_dirs:
-                    docket_path = self.join_paths(agency_path, docket_dir)
-                    if self.is_directory(docket_path):
-                        if self._should_process_docket(docket_path):
-                            self._process_single_docket(docket_path)
-                        else:
-                            self.logger.debug(f"Skipping docket: {docket_dir} (filtered out)")
+                agencies = [d for d in self.list_directory(raw_data_path) 
+                          if self.is_directory(self.join_paths(raw_data_path, d))]
+                self.logger.info(f"Found {len(agencies)} agencies to process")
             except Exception as e:
-                self.logger.warning(f"Error listing dockets for agency {agency_dir}: {e}")
-                continue
+                self.logger.error(f"Failed to get agency list: {e}")
+                return False
         
-        return True
+        # Setup progress bars
+        agency_pbar = None
+        docket_pbar = None
+        file_pbar = None
+        
+        try:
+            # Agency-level progress bar (only if processing multiple agencies)
+            if len(agencies) > 1:
+                agency_pbar = tqdm(agencies, desc="Processing agencies", unit="agency", position=0)
+            else:
+                agency_pbar = agencies  # Just iterate directly
+            
+            # Process each agency
+            for agency in agency_pbar:
+                agency_path = self.join_paths(raw_data_path, agency)
+                
+                # Quick check if agency directory exists
+                if not self.path_exists(agency_path):
+                    continue
+                
+                if len(agencies) > 1:
+                    agency_pbar.set_description(f"Processing {agency}")
+                
+                # Get list of dockets
+                try:
+                    docket_dirs = self.list_directory(agency_path)
+                    dockets = [d for d in docket_dirs if self.is_directory(self.join_paths(agency_path, d))]
+                except Exception as e:
+                    self.logger.warning(f"Error listing dockets for agency {agency}: {e}")
+                    continue
+                
+                # Docket-level progress bar
+                docket_pbar = tqdm(dockets, desc=f"Processing {agency} dockets", unit="docket", position=1, leave=False)
+                
+                for docket_dir in docket_pbar:
+                    docket_path = self.join_paths(agency_path, docket_dir)
+                    docket_pbar.set_description(f"Processing {docket_dir}")
+                    
+                    # Process the docket
+                    self._process_single_docket_with_progress(docket_path, file_pbar)
+                
+                docket_pbar.close()
+            
+            return True
+            
+        finally:
+            # Clean up progress bars
+            if agency_pbar and hasattr(agency_pbar, 'close'):
+                agency_pbar.close()
+            if docket_pbar and hasattr(docket_pbar, 'close'):
+                docket_pbar.close()
+            if file_pbar and hasattr(file_pbar, 'close'):
+                file_pbar.close()
     
     def _process_single_docket(self, docket_path: str):
         """Process a single docket"""
@@ -1055,15 +1146,34 @@ class IcebergConverter:
             self.logger.error(f"Error processing {docket_path}: {e}")
             self.stats['errors'] += 1
     
-    def add_filters(self, agency: str = None, docket_pattern: str = None):
-        """Add filters to process only specific agencies or dockets"""
+    def _process_single_docket_with_progress(self, docket_path: str, file_pbar=None):
+        """Process a single docket with file-level progress bar for comments"""
+        try:
+            docket_name = PathHandler.get_name(docket_path)
+            
+            # Process docket
+            docket_data = self.process_docket(docket_path, file_pbar)
+            
+            # Save dataset
+            if self.save_docket_dataset(docket_data):
+                self.stats['dockets_processed'] += 1
+            else:
+                self.stats['dockets_skipped'] += 1
+                
+        except (PermissionError, OSError) as e:
+            self.logger.error(f"Permission error processing {docket_path}: {e}")
+            self.logger.error("Stopping conversion due to permission issues.")
+            self.stats['errors'] += 1
+            raise
+        except Exception as e:
+            self.logger.error(f"Error processing {docket_path}: {e}")
+            self.stats['errors'] += 1
+    
+    def add_filters(self, agency: str = None):
+        """Add filters to process only specific agencies"""
         if agency:
             self.agency_filter = agency.upper()
             self.logger.info(f"Added agency filter: {self.agency_filter}")
-        
-        if docket_pattern:
-            self.docket_pattern_filter = docket_pattern
-            self.logger.info(f"Added docket pattern filter: {self.docket_pattern_filter}")
     
     def _should_process_docket(self, docket_path: str) -> bool:
         """Check if a docket should be processed based on filters"""
@@ -1080,12 +1190,6 @@ class IcebergConverter:
                 agency = "UNKNOWN"
             
             if agency != self.agency_filter:
-                return False
-        
-        # Check docket pattern filter
-        if self.docket_pattern_filter:
-            import fnmatch
-            if not fnmatch.fnmatch(docket_name, self.docket_pattern_filter):
                 return False
         
         return True
@@ -1193,7 +1297,6 @@ def main():
     parser.add_argument("data_path", help="Path to Mirrulations data directory or S3 bucket path")
     parser.add_argument("--output-path", help="Output directory for Iceberg data or S3 bucket path")
     parser.add_argument("--agency", help="Process only a specific agency (e.g., 'CMS', 'DEA')")
-    parser.add_argument("--docket-pattern", help="Process only dockets matching a pattern (e.g., 'CMS-2025-*')")
     parser.add_argument("--compression", default="snappy", 
                        choices=["snappy", "gzip", "brotli", "lz4"],
                        help="Compression algorithm for Parquet files")
@@ -1221,8 +1324,8 @@ def main():
     )
     
     # Apply filters if specified
-    if args.agency or args.docket_pattern:
-        converter.add_filters(agency=args.agency, docket_pattern=args.docket_pattern)
+    if args.agency:
+        converter.add_filters(agency=args.agency)
     
     # Run conversion
     try:
