@@ -8,7 +8,8 @@ This script converts each docket into its own Iceberg dataset with three tables:
 3. comments - Comment data with flattened structure
 
 Usage:
-    python convert_to_iceberg.py /path/to/mirrulations/data [--s3-bucket bucket-name]
+    python convert_to_iceberg.py /path/to/mirrulations/data [--output-path /path/to/output]
+    python convert_to_iceberg.py s3://bucket/mirrulations [--output-path s3://bucket/output]
 """
 
 import json
@@ -17,13 +18,14 @@ import sys
 import argparse
 import time
 from pathlib import Path
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Union
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from tqdm import tqdm
 import logging
 from datetime import datetime
+import re
 
 # S3 imports
 import boto3
@@ -31,24 +33,93 @@ from botocore.exceptions import ClientError
 import s3fs
 
 
+class PathHandler:
+    """Handle both local and S3 paths"""
+    
+    @staticmethod
+    def is_s3_path(path: str) -> bool:
+        """Check if a path is an S3 path"""
+        return path.startswith('s3://')
+    
+    @staticmethod
+    def parse_s3_path(s3_path: str) -> tuple[str, str]:
+        """Parse S3 path into bucket and key"""
+        if not s3_path.startswith('s3://'):
+            raise ValueError(f"Not an S3 path: {s3_path}")
+        
+        # Remove s3:// prefix
+        path_without_prefix = s3_path[5:]
+        
+        # Split into bucket and key
+        if '/' in path_without_prefix:
+            bucket = path_without_prefix.split('/')[0]
+            key = '/'.join(path_without_prefix.split('/')[1:])
+        else:
+            bucket = path_without_prefix
+            key = ""
+        
+        return bucket, key
+    
+    @staticmethod
+    def join_s3_path(bucket: str, key: str) -> str:
+        """Join bucket and key into S3 path"""
+        if key:
+            return f"s3://{bucket}/{key}"
+        else:
+            return f"s3://{bucket}"
+    
+    @staticmethod
+    def get_parent_path(path: str) -> str:
+        """Get parent path for both local and S3 paths"""
+        if PathHandler.is_s3_path(path):
+            bucket, key = PathHandler.parse_s3_path(path)
+            if '/' in key:
+                parent_key = '/'.join(key.split('/')[:-1])
+                return PathHandler.join_s3_path(bucket, parent_key)
+            else:
+                return f"s3://{bucket}"
+        else:
+            return str(Path(path).parent)
+    
+    @staticmethod
+    def get_name(path: str) -> str:
+        """Get name component for both local and S3 paths"""
+        if PathHandler.is_s3_path(path):
+            bucket, key = PathHandler.parse_s3_path(path)
+            if key:
+                return key.split('/')[-1]
+            else:
+                return bucket
+        else:
+            return Path(path).name
+
+
 class IcebergConverter:
     """Convert Mirrulations data to Iceberg format"""
     
-    def __init__(self, data_path: str, output_path: str = None, s3_bucket: str = None, debug: bool = False):
-        self.data_path = Path(data_path)
+    def __init__(self, data_path: str, output_path: str = None, debug: bool = False, verbose: bool = False, comment_threshold: int = 10):
+        self.data_path = data_path
+        self.is_s3_source = PathHandler.is_s3_path(data_path)
+        
         # If no output path specified, create derived-data inside the data_path directory
         if output_path:
-            self.output_path = Path(output_path).resolve()
+            self.output_path = output_path
             self.use_derived_data_subdir = True  # Need to create derived-data/ subdirectory
         else:
-            self.output_path = self.data_path / "derived-data"
+            if self.is_s3_source:
+                # For S3, append derived-data to the path
+                self.output_path = f"{data_path}/derived-data"
+            else:
+                # For local, use Path to handle the join
+                self.output_path = str(Path(data_path) / "derived-data")
             self.use_derived_data_subdir = False  # Already pointing to derived-data directory
-        self.s3_bucket = s3_bucket
-        self.s3_client = None
-        self.s3_fs = None
+        
+        self.is_s3_target = PathHandler.is_s3_path(self.output_path)
+        self.verbose = verbose
+        self.comment_threshold = comment_threshold
         
         # Setup logging
-        log_level = logging.DEBUG if debug else logging.INFO
+        log_level = logging.DEBUG if debug else (logging.INFO if verbose else logging.WARNING)
         logging.basicConfig(
             level=log_level,
             format='%(asctime)s - %(levelname)s - %(message)s',
@@ -59,8 +130,9 @@ class IcebergConverter:
         )
         self.logger = logging.getLogger(__name__)
         
-        # Setup S3 if specified
-        if s3_bucket:
+        # Setup S3 filesystem if needed
+        self.s3_fs = None
+        if self.is_s3_source or self.is_s3_target:
             self.setup_s3()
         
         # Statistics
@@ -72,14 +144,133 @@ class IcebergConverter:
         }
     
     def setup_s3(self):
-        """Setup S3 client and filesystem"""
+        """Setup S3 filesystem"""
         try:
-            self.s3_client = boto3.client('s3')
             self.s3_fs = s3fs.S3FileSystem()
-            self.logger.info(f"S3 setup complete for bucket: {self.s3_bucket}")
+            self.logger.info("S3 filesystem setup complete")
         except Exception as e:
-            self.logger.error(f"Failed to setup S3: {e}")
+            self.logger.error(f"Failed to setup S3 filesystem: {e}")
             raise
+    
+    def list_directory(self, path: str) -> List[str]:
+        """List directory contents for both local and S3 paths"""
+        if PathHandler.is_s3_path(path):
+            if not self.s3_fs:
+                raise RuntimeError("S3 filesystem not initialized")
+            
+            try:
+                # Ensure path ends with / for directory listing
+                if not path.endswith('/'):
+                    path += '/'
+                
+                # List contents
+                contents = []
+                for item in self.s3_fs.ls(path):
+                    # Remove the path prefix to get relative names
+                    relative_name = item.replace(path, '').rstrip('/')
+                    if relative_name and '/' not in relative_name:  # Only immediate children
+                        contents.append(relative_name)
+                
+                return contents
+            except Exception as e:
+                self.logger.error(f"Failed to list S3 directory {path}: {e}")
+                return []
+        else:
+            try:
+                return [item.name for item in Path(path).iterdir()]
+            except Exception as e:
+                self.logger.error(f"Failed to list local directory {path}: {e}")
+                return []
+    
+    def path_exists(self, path: str) -> bool:
+        """Check if path exists for both local and S3 paths"""
+        if PathHandler.is_s3_path(path):
+            if not self.s3_fs:
+                return False
+            
+            try:
+                return self.s3_fs.exists(path)
+            except Exception as e:
+                self.logger.error(f"Failed to check S3 path {path}: {e}")
+                return False
+        else:
+            return Path(path).exists()
+    
+    def is_directory(self, path: str) -> bool:
+        """Check if path is a directory for both local and S3 paths"""
+        if PathHandler.is_s3_path(path):
+            if not self.s3_fs:
+                return False
+            
+            try:
+                # For S3, check if it's a directory by listing it
+                return self.s3_fs.isdir(path)
+            except Exception as e:
+                self.logger.error(f"Failed to check if S3 path is directory {path}: {e}")
+                return False
+        else:
+            return Path(path).is_dir()
+    
+    def join_paths(self, base: str, *parts: str) -> str:
+        """Join paths for both local and S3 paths"""
+        if PathHandler.is_s3_path(base):
+            # For S3, manually join with /
+            result = base.rstrip('/')
+            for part in parts:
+                result += '/' + part.lstrip('/')
+            return result
+        else:
+            # For local, use Path
+            return str(Path(base).joinpath(*parts))
+    
+    def load_json_file(self, file_path: str) -> Optional[Dict[str, Any]]:
+        """Load and parse JSON file from both local and S3 paths"""
+        try:
+            if PathHandler.is_s3_path(file_path):
+                if not self.s3_fs:
+                    raise RuntimeError("S3 filesystem not initialized")
+                
+                with self.s3_fs.open(file_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            else:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+        except PermissionError as e:
+            self.logger.error(f"Permission denied reading {file_path}: {e}")
+            raise
+        except FileNotFoundError as e:
+            self.logger.warning(f"File not found: {file_path}")
+            return None
+        except Exception as e:
+            self.logger.warning(f"Failed to load {file_path}: {e}")
+            return None
+    
+    def glob_files(self, directory: str, pattern: str) -> List[str]:
+        """Glob files for both local and S3 paths"""
+        if PathHandler.is_s3_path(directory):
+            if not self.s3_fs:
+                return []
+            
+            try:
+                # Convert glob pattern to regex for S3
+                regex_pattern = pattern.replace('*', '.*')
+                files = []
+                
+                for item in self.s3_fs.ls(directory):
+                    item_name = PathHandler.get_name(item)
+                    if re.match(regex_pattern, item_name):
+                        files.append(item)
+                
+                return files
+            except Exception as e:
+                self.logger.error(f"Failed to glob S3 files {directory}/{pattern}: {e}")
+                return []
+        else:
+            try:
+                return [str(f) for f in Path(directory).glob(pattern)]
+            except Exception as e:
+                self.logger.error(f"Failed to glob local files {directory}/{pattern}: {e}")
+                return []
     
     def flatten_docket_data(self, json_data: Dict[str, Any]) -> Dict[str, Any]:
         """Flatten docket JSON structure"""
@@ -162,24 +353,9 @@ class IcebergConverter:
         
         return flattened
     
-    def load_json_file(self, file_path: Path) -> Optional[Dict[str, Any]]:
-        """Load and parse JSON file"""
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except PermissionError as e:
-            self.logger.error(f"Permission denied reading {file_path}: {e}")
-            raise
-        except FileNotFoundError as e:
-            self.logger.warning(f"File not found: {file_path}")
-            return None
-        except Exception as e:
-            self.logger.warning(f"Failed to load {file_path}: {e}")
-            return None
-    
-    def process_docket(self, docket_path: Path, outer_pbar=None) -> Dict[str, Any]:
+    def process_docket(self, docket_path: str, outer_pbar=None) -> Dict[str, Any]:
         """Process a single docket directory"""
-        docket_id = docket_path.name
+        docket_id = PathHandler.get_name(docket_path)
         
         # Determine agency from docket ID (e.g., "DEA-2016-0015" -> "DEA")
         # Handle cases like "ACF/ACF-2024-0005" -> "ACF"
@@ -203,11 +379,11 @@ class IcebergConverter:
         
         # Debug: Check what directories exist
         self.logger.debug(f"  Docket path: {docket_path}")
-        if docket_path.exists():
-            contents = [d.name for d in docket_path.iterdir() if d.is_dir()]
+        if self.path_exists(docket_path):
+            contents = self.list_directory(docket_path)
             self.logger.debug(f"  Contents: {contents}")
             # Also log if we find text-* directories
-            text_dirs = [d.name for d in docket_path.iterdir() if d.is_dir() and d.name.startswith('text-')]
+            text_dirs = [d for d in contents if d.startswith('text-')]
             if text_dirs:
                 self.logger.debug(f"  Found text-* directories: {text_dirs}")
         else:
@@ -215,22 +391,22 @@ class IcebergConverter:
             return result
         
         # Look for data in raw-data subdirectory
-        raw_data_path = docket_path / "raw-data"
-        if raw_data_path.exists():
+        raw_data_path = self.join_paths(docket_path, "raw-data")
+        if self.path_exists(raw_data_path):
             # Process docket info
-            docket_file = raw_data_path / "docket" / f"{docket_id}.json"
-            if docket_file.exists():
+            docket_file = self.join_paths(raw_data_path, "docket", f"{docket_id}.json")
+            if self.path_exists(docket_file):
                 docket_data = self.load_json_file(docket_file)
                 if docket_data:
                     result['docket_info'] = self.flatten_docket_data(docket_data)
             else:
                 # Try alternative docket file paths
                 alt_paths = [
-                    raw_data_path / "docket.json",
-                    raw_data_path / f"{docket_id}.json"
+                    self.join_paths(raw_data_path, "docket.json"),
+                    self.join_paths(raw_data_path, f"{docket_id}.json")
                 ]
                 for alt_path in alt_paths:
-                    if alt_path.exists():
+                    if self.path_exists(alt_path):
                         docket_data = self.load_json_file(alt_path)
                         if docket_data:
                             result['docket_info'] = self.flatten_docket_data(docket_data)
@@ -238,13 +414,13 @@ class IcebergConverter:
                 
                 # NEW: Try the text-* subdirectory structure
                 if result['docket_info'] is None:
-                    text_subdirs = [d for d in raw_data_path.iterdir() if d.is_dir() and d.name.startswith('text-')]
+                    text_subdirs = [d for d in self.list_directory(raw_data_path) if d.startswith('text-')]
                     if text_subdirs:
-                        self.logger.debug(f"  Trying text-* subdirectories: {[d.name for d in text_subdirs]}")
+                        self.logger.debug(f"  Trying text-* subdirectories: {[d for d in text_subdirs]}")
                     for text_subdir in text_subdirs:
-                        docket_file = text_subdir / "docket" / f"{docket_id}.json"
+                        docket_file = self.join_paths(self.join_paths(raw_data_path, text_subdir), "docket", f"{docket_id}.json")
                         self.logger.debug(f"  Checking for docket file: {docket_file}")
-                        if docket_file.exists():
+                        if self.path_exists(docket_file):
                             self.logger.debug(f"  Found docket file: {docket_file}")
                             docket_data = self.load_json_file(docket_file)
                             if docket_data:
@@ -252,9 +428,9 @@ class IcebergConverter:
                                 break
             
             # Process documents
-            documents_dir = raw_data_path / "documents"
-            if documents_dir.exists():
-                for doc_file in documents_dir.glob("*.json"):
+            documents_dir = self.join_paths(raw_data_path, "documents")
+            if self.path_exists(documents_dir):
+                for doc_file in self.glob_files(documents_dir, "*.json"):
                     doc_data = self.load_json_file(doc_file)
                     if doc_data:
                         flattened_doc = self.flatten_document_data(doc_data)
@@ -262,23 +438,23 @@ class IcebergConverter:
             
             # NEW: Try the text-* subdirectory structure for documents
             if not result['documents']:
-                text_subdirs = [d for d in raw_data_path.iterdir() if d.is_dir() and d.name.startswith('text-')]
+                text_subdirs = [d for d in self.list_directory(raw_data_path) if d.startswith('text-')]
                 if text_subdirs:
-                    self.logger.debug(f"  Trying text-* subdirectories for documents: {[d.name for d in text_subdirs]}")
+                    self.logger.debug(f"  Trying text-* subdirectories for documents: {[d for d in text_subdirs]}")
                 for text_subdir in text_subdirs:
-                    documents_dir = text_subdir / "documents"
-                    if documents_dir.exists():
+                    documents_dir = self.join_paths(raw_data_path, text_subdir, "documents")
+                    if self.path_exists(documents_dir):
                         self.logger.debug(f"  Found documents directory: {documents_dir}")
-                        for doc_file in documents_dir.glob("*.json"):
+                        for doc_file in self.glob_files(documents_dir, "*.json"):
                             doc_data = self.load_json_file(doc_file)
                             if doc_data:
                                 flattened_doc = self.flatten_document_data(doc_data)
                                 result['documents'].append(flattened_doc)
             
             # Process comments
-            comments_dir = raw_data_path / "comments"
-            if comments_dir.exists():
-                comment_files = list(comments_dir.glob("*.json"))
+            comments_dir = self.join_paths(raw_data_path, "comments")
+            if self.path_exists(comments_dir):
+                comment_files = self.glob_files(comments_dir, "*.json")
                 if len(comment_files) > self.comment_threshold and outer_pbar:  # Only show nested bar for dockets with many comments
                     with tqdm(comment_files, desc=f"  Processing {len(comment_files)} comments", 
                              leave=False, position=1) as comment_pbar:
@@ -296,14 +472,14 @@ class IcebergConverter:
             
             # NEW: Try the text-* subdirectory structure for comments
             if not result['comments']:
-                text_subdirs = [d for d in raw_data_path.iterdir() if d.is_dir() and d.name.startswith('text-')]
+                text_subdirs = [d for d in self.list_directory(raw_data_path) if d.startswith('text-')]
                 if text_subdirs:
-                    self.logger.debug(f"  Trying text-* subdirectories for comments: {[d.name for d in text_subdirs]}")
+                    self.logger.debug(f"  Trying text-* subdirectories for comments: {[d for d in text_subdirs]}")
                 for text_subdir in text_subdirs:
-                    comments_dir = text_subdir / "comments"
-                    if comments_dir.exists():
+                    comments_dir = self.join_paths(raw_data_path, text_subdir, "comments")
+                    if self.path_exists(comments_dir):
                         self.logger.debug(f"  Found comments directory: {comments_dir}")
-                        comment_files = list(comments_dir.glob("*.json"))
+                        comment_files = self.glob_files(comments_dir, "*.json")
                         if len(comment_files) > self.comment_threshold and outer_pbar:  # Only show nested bar for dockets with many comments
                             with tqdm(comment_files, desc=f"  Processing {len(comment_files)} comments", 
                                      leave=False, position=1) as comment_pbar:
@@ -322,19 +498,19 @@ class IcebergConverter:
         # Also check for direct structure (fallback)
         else:
             # Process docket info
-            docket_file = docket_path / "docket" / f"{docket_id}.json"
-            if docket_file.exists():
+            docket_file = self.join_paths(docket_path, "docket", f"{docket_id}.json")
+            if self.path_exists(docket_file):
                 docket_data = self.load_json_file(docket_file)
                 if docket_data:
                     result['docket_info'] = self.flatten_docket_data(docket_data)
             else:
                 # Try alternative docket file paths
                 alt_paths = [
-                    docket_path / "docket.json",
-                    docket_path / f"{docket_id}.json"
+                    self.join_paths(docket_path, "docket.json"),
+                    self.join_paths(docket_path, f"{docket_id}.json")
                 ]
                 for alt_path in alt_paths:
-                    if alt_path.exists():
+                    if self.path_exists(alt_path):
                         docket_data = self.load_json_file(alt_path)
                         if docket_data:
                             result['docket_info'] = self.flatten_docket_data(docket_data)
@@ -342,19 +518,19 @@ class IcebergConverter:
                 
                 # NEW: Try the text-* subdirectory structure
                 if result['docket_info'] is None:
-                    text_subdirs = [d for d in docket_path.iterdir() if d.is_dir() and d.name.startswith('text-')]
+                    text_subdirs = [d for d in self.list_directory(docket_path) if d.startswith('text-')]
                     for text_subdir in text_subdirs:
-                        docket_file = text_subdir / "docket" / f"{docket_id}.json"
-                        if docket_file.exists():
+                        docket_file = self.join_paths(self.join_paths(docket_path, text_subdir), "docket", f"{docket_id}.json")
+                        if self.path_exists(docket_file):
                             docket_data = self.load_json_file(docket_file)
                             if docket_data:
                                 result['docket_info'] = self.flatten_docket_data(docket_data)
                                 break
             
             # Process documents
-            documents_dir = docket_path / "documents"
-            if documents_dir.exists():
-                for doc_file in documents_dir.glob("*.json"):
+            documents_dir = self.join_paths(docket_path, "documents")
+            if self.path_exists(documents_dir):
+                for doc_file in self.glob_files(documents_dir, "*.json"):
                     doc_data = self.load_json_file(doc_file)
                     if doc_data:
                         flattened_doc = self.flatten_document_data(doc_data)
@@ -362,20 +538,20 @@ class IcebergConverter:
             
             # NEW: Try the text-* subdirectory structure for documents
             if not result['documents']:
-                text_subdirs = [d for d in docket_path.iterdir() if d.is_dir() and d.name.startswith('text-')]
+                text_subdirs = [d for d in self.list_directory(docket_path) if d.startswith('text-')]
                 for text_subdir in text_subdirs:
-                    documents_dir = text_subdir / "documents"
-                    if documents_dir.exists():
-                        for doc_file in documents_dir.glob("*.json"):
+                    documents_dir = self.join_paths(docket_path, text_subdir, "documents")
+                    if self.path_exists(documents_dir):
+                        for doc_file in self.glob_files(documents_dir, "*.json"):
                             doc_data = self.load_json_file(doc_file)
                             if doc_data:
                                 flattened_doc = self.flatten_document_data(doc_data)
                                 result['documents'].append(flattened_doc)
             
             # Process comments
-            comments_dir = docket_path / "comments"
-            if comments_dir.exists():
-                comment_files = list(comments_dir.glob("*.json"))
+            comments_dir = self.join_paths(docket_path, "comments")
+            if self.path_exists(comments_dir):
+                comment_files = self.glob_files(comments_dir, "*.json")
                 if len(comment_files) > self.comment_threshold and outer_pbar:  # Only show nested bar for dockets with many comments
                     with tqdm(comment_files, desc=f"  Processing {len(comment_files)} comments", 
                              leave=False, position=1) as comment_pbar:
@@ -393,11 +569,11 @@ class IcebergConverter:
             
             # NEW: Try the text-* subdirectory structure for comments
             if not result['comments']:
-                text_subdirs = [d for d in docket_path.iterdir() if d.is_dir() and d.name.startswith('text-')]
+                text_subdirs = [d for d in self.list_directory(docket_path) if d.startswith('text-')]
                 for text_subdir in text_subdirs:
-                    comments_dir = text_subdir / "comments"
-                    if comments_dir.exists():
-                        comment_files = list(comments_dir.glob("*.json"))
+                    comments_dir = self.join_paths(docket_path, text_subdir, "comments")
+                    if self.path_exists(comments_dir):
+                        comment_files = self.glob_files(comments_dir, "*.json")
                         if len(comment_files) > self.comment_threshold and outer_pbar:  # Only show nested bar for dockets with many comments
                             with tqdm(comment_files, desc=f"  Processing {len(comment_files)} comments", 
                                      leave=False, position=1) as comment_pbar:
@@ -420,44 +596,50 @@ class IcebergConverter:
         return result
     
     def save_to_parquet(self, data: List[Dict[str, Any]], table_name: str, 
-                       output_dir: Path, compression: str = 'snappy') -> bool:
+                        output_dir: str, compression: str = 'snappy') -> bool:
         """Save data to Parquet format"""
         if not data:
             return False
         
         try:
             df = pd.DataFrame(data)
-            parquet_path = output_dir / f"{table_name}.parquet"
             
-            # Create output directory
-            try:
-                output_dir.mkdir(parents=True, exist_ok=True)
-            except PermissionError as e:
-                self.logger.error(f"Permission denied creating directory {output_dir}: {e}")
-                raise
-            except Exception as e:
-                self.logger.error(f"Failed to create directory {output_dir}: {e}")
-                raise
-            
-            # Save to Parquet
-            try:
-                df.to_parquet(parquet_path, index=False, compression=compression)
-            except PermissionError as e:
-                self.logger.error(f"Permission denied writing to {parquet_path}: {e}")
-                raise
-            except Exception as e:
-                self.logger.error(f"Failed to save {table_name} to {parquet_path}: {e}")
-                raise
-            
-            # Upload to S3 if configured
-            if self.s3_bucket and self.s3_fs:
+            if self.is_s3_target:
+                # For S3, save directly to S3
+                parquet_path = self.join_paths(output_dir, f"{table_name}.parquet")
                 try:
-                    s3_path = f"s3://{self.s3_bucket}/{parquet_path}"
-                    self.s3_fs.put(str(parquet_path), s3_path)
-                    self.logger.info(f"Uploaded to S3: {s3_path}")
+                    # Convert DataFrame to bytes and upload to S3
+                    buffer = df.to_parquet(index=False, compression=compression)
+                    with self.s3_fs.open(parquet_path, 'wb') as f:
+                        f.write(buffer)
+                    self.logger.info(f"Saved to S3: {parquet_path}")
                 except Exception as e:
-                    self.logger.error(f"Failed to upload to S3: {e}")
-                    # Don't raise here - S3 upload failure shouldn't stop the process
+                    self.logger.error(f"Failed to save {table_name} to S3 {parquet_path}: {e}")
+                    return False
+            else:
+                # For local, save to local filesystem
+                parquet_path = self.join_paths(output_dir, f"{table_name}.parquet")
+                
+                # Create output directory
+                try:
+                    output_dir_path = Path(output_dir)
+                    output_dir_path.mkdir(parents=True, exist_ok=True)
+                except PermissionError as e:
+                    self.logger.error(f"Permission denied creating directory {output_dir}: {e}")
+                    raise
+                except Exception as e:
+                    self.logger.error(f"Failed to create directory {output_dir}: {e}")
+                    raise
+                
+                # Save to Parquet
+                try:
+                    df.to_parquet(parquet_path, index=False, compression=compression)
+                except PermissionError as e:
+                    self.logger.error(f"Permission denied writing to {parquet_path}: {e}")
+                    raise
+                except Exception as e:
+                    self.logger.error(f"Failed to save {table_name} to {parquet_path}: {e}")
+                    raise
             
             return True
             
@@ -476,10 +658,10 @@ class IcebergConverter:
         # Create output directory - handle both cases
         if self.use_derived_data_subdir:
             # When output_path is specified, create derived-data/agency/docket_id/iceberg
-            output_dir = self.output_path / "derived-data" / agency / docket_id / "iceberg"
+            output_dir = self.join_paths(self.output_path, "derived-data", agency, docket_id, "iceberg")
         else:
             # When using default, already pointing to derived-data, so just agency/docket_id/iceberg
-            output_dir = self.output_path / agency / docket_id / "iceberg"
+            output_dir = self.join_paths(self.output_path, agency, docket_id, "iceberg")
         
         success = True
         files_created = 0
@@ -512,37 +694,40 @@ class IcebergConverter:
         
         return success
     
-    def get_docket_directories(self) -> List[Path]:
+    def get_docket_directories(self) -> List[str]:
         """Get all docket directories from the data path"""
         dockets = []
         
         # Look for raw-data structure (Mirrulations format)
-        raw_data_path = self.data_path / "raw-data"
-        if raw_data_path.exists():
+        raw_data_path = self.join_paths(self.data_path, "raw-data")
+        if self.path_exists(raw_data_path):
             self.logger.debug(f"Found raw-data structure at {raw_data_path}")
-            for agency_dir in raw_data_path.iterdir():
-                if agency_dir.is_dir():
-                    self.logger.debug(f"  Agency: {agency_dir.name}")
-                    for docket_dir in agency_dir.iterdir():
-                        if docket_dir.is_dir():
-                            dockets.append(docket_dir)
-                            self.logger.debug(f"    Docket: {docket_dir.name}")
+            for agency_dir in self.list_directory(raw_data_path):
+                agency_path = self.join_paths(raw_data_path, agency_dir)
+                if self.is_directory(agency_path):
+                    self.logger.debug(f"  Agency: {agency_dir}")
+                    for docket_dir in self.list_directory(agency_path):
+                        docket_path = self.join_paths(agency_path, docket_dir)
+                        if self.is_directory(docket_path):
+                            dockets.append(docket_path)
+                            self.logger.debug(f"    Docket: {docket_dir}")
         
         # Look for direct docket structure (like in results/)
         else:
             self.logger.debug(f"No raw-data structure, looking for direct docket structure")
-            for docket_dir in self.data_path.iterdir():
-                if docket_dir.is_dir() and not docket_dir.name.startswith('.'):
+            for docket_dir in self.list_directory(self.data_path):
+                docket_path = self.join_paths(self.data_path, docket_dir)
+                if self.is_directory(docket_path) and not PathHandler.get_name(docket_path).startswith('.'):
                     # Check if this looks like a docket directory
-                    if (docket_dir / "raw-data").exists() or (docket_dir / "docket").exists():
-                        dockets.append(docket_dir)
-                        self.logger.debug(f"  Found docket: {docket_dir.name}")
+                    if self.path_exists(self.join_paths(docket_path, "raw-data")) or self.path_exists(self.join_paths(docket_path, "docket")):
+                        dockets.append(docket_path)
+                        self.logger.debug(f"  Found docket: {PathHandler.get_name(docket_path)}")
         
         # Filter out non-docket directories and sort
         filtered_dockets = []
         for docket in dockets:
             # Skip derived-data and other non-docket directories
-            if docket.name not in ['derived-data', 'raw-data']:
+            if PathHandler.get_name(docket) not in ['derived-data', 'raw-data']:
                 filtered_dockets.append(docket)
         
         self.logger.info(f"Found {len(filtered_dockets)} docket directories")
@@ -553,83 +738,57 @@ class IcebergConverter:
         self.logger.info("Checking permissions...")
         
         # Check if data directory exists and is readable
-        if not self.data_path.exists():
+        if not self.path_exists(self.data_path):
             raise FileNotFoundError(f"Data directory does not exist: {self.data_path}")
         
-        if not os.access(self.data_path, os.R_OK):
-            raise PermissionError(f"No read permission for data directory: {self.data_path}")
+        # For local paths, check file system permissions
+        if not PathHandler.is_s3_path(self.data_path):
+            if not os.access(self.data_path, os.R_OK):
+                raise PermissionError(f"No read permission for data directory: {self.data_path}")
         
         # Check if we can list the contents
         try:
-            list(self.data_path.iterdir())
+            self.list_directory(self.data_path)
         except PermissionError as e:
             raise PermissionError(f"Cannot list contents of data directory {self.data_path}: {e}")
         
         # Check output directory permissions
-        if self.output_path.exists():
-            if not os.access(self.output_path, os.W_OK):
+        if self.path_exists(self.output_path):
+            if not PathHandler.is_s3_path(self.output_path) and not os.access(self.output_path, os.W_OK):
                 raise PermissionError(f"No write permission for output directory: {self.output_path}")
         else:
             # Try to create the output directory
-            try:
-                self.output_path.mkdir(parents=True, exist_ok=True)
-                # Test write permission by creating a temporary file
-                test_file = self.output_path / ".test_write_permission"
-                test_file.write_text("test")
-                test_file.unlink()
-            except (PermissionError, OSError) as e:
-                raise PermissionError(f"Cannot create or write to output directory {self.output_path}: {e}")
+            if PathHandler.is_s3_path(self.output_path):
+                # For S3, we'll test write permission by trying to create a test file
+                try:
+                    test_path = self.join_paths(self.output_path, ".test_write_permission")
+                    with self.s3_fs.open(test_path, 'w') as f:
+                        f.write("test")
+                    self.s3_fs.delete(test_path)
+                except Exception as e:
+                    raise PermissionError(f"Cannot write to S3 output directory {self.output_path}: {e}")
+            else:
+                try:
+                    output_dir_path = Path(self.output_path)
+                    output_dir_path.mkdir(parents=True, exist_ok=True)
+                    # Test write permission by creating a temporary file
+                    test_file = output_dir_path / ".test_write_permission"
+                    test_file.write_text("test")
+                    test_file.unlink()
+                except (PermissionError, OSError) as e:
+                    raise PermissionError(f"Cannot create or write to output directory {self.output_path}: {e}")
         
         self.logger.info("Permission check passed.")
-    
-    def __init__(self, data_path: str, output_path: str = None, s3_bucket: str = None, debug: bool = False, verbose: bool = False, comment_threshold: int = 10):
-        self.data_path = Path(data_path)
-        # If no output path specified, create derived-data inside the data_path directory
-        if output_path:
-            self.output_path = Path(output_path).resolve()
-            self.use_derived_data_subdir = True  # Need to create derived-data/ subdirectory
-        else:
-            self.output_path = self.data_path / "derived-data"
-            self.use_derived_data_subdir = False  # Already pointing to derived-data directory
-        self.s3_bucket = s3_bucket
-        self.s3_client = None
-        self.s3_fs = None
-        self.verbose = verbose
-        self.comment_threshold = comment_threshold
-        
-        # Setup logging
-        log_level = logging.DEBUG if debug else (logging.INFO if verbose else logging.WARNING)
-        logging.basicConfig(
-            level=log_level,
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler('iceberg_conversion.log'),
-                logging.StreamHandler()
-            ]
-        )
-        self.logger = logging.getLogger(__name__)
-        
-        # Setup S3 if specified
-        if s3_bucket:
-            self.setup_s3()
-        
-        # Statistics
-        self.stats = {
-            'dockets_processed': 0,
-            'dockets_skipped': 0,
-            'errors': 0,
-            'start_time': time.time()
-        }
-    
-
     
     def convert_all(self):
         """Convert all dockets to Iceberg format"""
         if self.verbose:
             self.logger.info(f"Starting conversion from: {self.data_path}")
             self.logger.info(f"Output path: {self.output_path}")
-            if self.s3_bucket:
-                self.logger.info(f"S3 bucket: {self.s3_bucket}")
+            if self.is_s3_source:
+                self.logger.info(f"Source: S3 bucket: {self.data_path}")
+            if self.is_s3_target:
+                self.logger.info(f"Target: S3 bucket: {self.output_path}")
         
         # Check permissions before starting
         try:
@@ -657,7 +816,7 @@ class IcebergConverter:
             for docket_dir in pbar:
                 try:
                     # Update progress bar description with current docket
-                    docket_name = docket_dir.name
+                    docket_name = PathHandler.get_name(docket_dir)
                     pbar.set_description(f"Converting {docket_name}")
                     
                     # Process docket
@@ -701,9 +860,8 @@ class IcebergConverter:
 def main():
     """Main function"""
     parser = argparse.ArgumentParser(description="Convert Mirrulations data to Iceberg format")
-    parser.add_argument("data_path", help="Path to Mirrulations data directory")
-    parser.add_argument("--output-path", help="Output directory for Iceberg data")
-    parser.add_argument("--s3-bucket", help="S3 bucket name for uploading results")
+    parser.add_argument("data_path", help="Path to Mirrulations data directory or S3 bucket path")
+    parser.add_argument("--output-path", help="Output directory for Iceberg data or S3 bucket path")
     parser.add_argument("--compression", default="snappy", 
                        choices=["snappy", "gzip", "brotli", "lz4"],
                        help="Compression algorithm for Parquet files")
@@ -717,7 +875,7 @@ def main():
     args = parser.parse_args()
     
     # Validate data path
-    if not Path(args.data_path).exists():
+    if not PathHandler.is_s3_path(args.data_path) and not Path(args.data_path).exists():
         print(f"Error: Data path does not exist: {args.data_path}")
         sys.exit(1)
     
@@ -725,7 +883,6 @@ def main():
     converter = IcebergConverter(
         data_path=args.data_path,
         output_path=args.output_path,
-        s3_bucket=args.s3_bucket,
         debug=args.debug,
         verbose=args.verbose,
         comment_threshold=args.comment_threshold
