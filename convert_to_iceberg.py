@@ -841,6 +841,8 @@ class IcebergConverter:
                 self.logger.info(f"Filtering to single agency: {self.agency_filter}")
             else:
                 self.logger.warning(f"Agency filter '{self.agency_filter}' not in known agencies list")
+                # If agency filter is not in known list, just try it anyway
+                known_agencies = [self.agency_filter]
         
         self.logger.info(f"Using optimized scanning with {len(known_agencies)} agencies")
         
@@ -858,24 +860,44 @@ class IcebergConverter:
                     # 1. List all dockets (if the agency is small)
                     # 2. Use a pattern-based approach for large agencies
                     
-                    # For now, let's try listing dockets for agencies that exist
-                    try:
-                        docket_dirs = self.list_directory(agency_path)
-                        self.logger.debug(f"  Found {len(docket_dirs)} dockets in {agency}")
-                        
-                        for docket_dir in docket_dirs:
-                            docket_path = self.join_paths(agency_path, docket_dir)
-                            if self.is_directory(docket_path):
-                                # Apply filters
+                    # If we have a specific docket pattern, we can be more efficient
+                    if self.docket_pattern_filter:
+                        self.logger.debug(f"  Using pattern-based search for docket: {self.docket_pattern_filter}")
+                        # For pattern-based search, we can use S3 prefix filtering
+                        try:
+                            # Extract the docket ID from the pattern (e.g., "FAA-2000-7032" from pattern)
+                            docket_id = self.docket_pattern_filter
+                            docket_path = self.join_paths(agency_path, docket_id)
+                            
+                            if self.path_exists(docket_path) and self.is_directory(docket_path):
                                 if self._should_process_docket(docket_path):
                                     dockets.append(docket_path)
-                                    self.logger.debug(f"    Docket: {docket_dir}")
+                                    self.logger.debug(f"    Found specific docket: {docket_id}")
                                 else:
-                                    self.logger.debug(f"    Skipping docket: {docket_dir} (filtered out)")
-                    except Exception as e:
-                        self.logger.warning(f"Error listing dockets for agency {agency}: {e}")
-                        # Continue with other agencies
-                        continue
+                                    self.logger.debug(f"    Skipping docket: {docket_id} (filtered out)")
+                            else:
+                                self.logger.debug(f"    Docket {docket_id} not found in {agency}")
+                        except Exception as e:
+                            self.logger.warning(f"Error checking specific docket {self.docket_pattern_filter} in agency {agency}: {e}")
+                    else:
+                        # List all dockets in the agency
+                        try:
+                            docket_dirs = self.list_directory(agency_path)
+                            self.logger.debug(f"  Found {len(docket_dirs)} dockets in {agency}")
+                            
+                            for docket_dir in docket_dirs:
+                                docket_path = self.join_paths(agency_path, docket_dir)
+                                if self.is_directory(docket_path):
+                                    # Apply filters
+                                    if self._should_process_docket(docket_path):
+                                        dockets.append(docket_path)
+                                        self.logger.debug(f"    Docket: {docket_dir}")
+                                    else:
+                                        self.logger.debug(f"    Skipping docket: {docket_dir} (filtered out)")
+                        except Exception as e:
+                            self.logger.warning(f"Error listing dockets for agency {agency}: {e}")
+                            # Continue with other agencies
+                            continue
         
         return dockets
     
